@@ -539,10 +539,9 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
         )
 
     def _unpermute(self, routed_output, input_shape, permuted_indices):
-        # Strip the padding sentinel row added by permute_and_pad
-        out_unpermuted = routed_output.new_empty(input_shape)
-        out_unpermuted[permuted_indices, :] = routed_output
-        return out_unpermuted[:-1]
+        from torchao.prototype.moe_training.ep.permute import unpermute_and_unpad
+
+        return unpermute_and_unpad(routed_output, input_shape, permuted_indices)
 
 
 @dataclass(frozen=True, kw_only=True)
