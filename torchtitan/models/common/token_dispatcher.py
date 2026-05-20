@@ -99,7 +99,8 @@ class LocalTokenDispatcher(Configurable):
         token_indices_experts_sorted = token_indices_experts_sorted // self.top_k
 
         # shape (bs*slen*top_k, dim)
-        routed_input = x[token_indices_experts_sorted]
+        from torchao.prototype.moe_training.ep.permute import dispatch_gather
+        routed_input = dispatch_gather(x, token_indices_experts_sorted)
 
         # Apply scores before expert computation if configured
         if self.score_before_experts:
@@ -268,7 +269,8 @@ class AllToAllTokenDispatcher(LocalTokenDispatcher):
         token_indices_experts_sorted = token_indices_experts_sorted // self.top_k
 
         # shape (bs*slen*top_k, dim)
-        routed_input = x[token_indices_experts_sorted]
+        from torchao.prototype.moe_training.ep.permute import dispatch_gather
+        routed_input = dispatch_gather(x, token_indices_experts_sorted)
 
         # Apply scores before expert computation if configured
         if self.score_before_experts:
