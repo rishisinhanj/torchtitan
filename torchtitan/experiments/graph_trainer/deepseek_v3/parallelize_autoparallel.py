@@ -65,6 +65,16 @@ def _set_torchtitan_fields(parallel_model):
         for block in parallel_model.layers.values():
             block.moe_enabled = hasattr(block, "moe")
 
+    # The base torchtitan trainer calls `model.get_attention_masks(...)` when
+    # the model_config's inner_attention is FlexAttention.Config (see
+    # torchtitan/trainer.py:610). For AP's 16B path the inner_attention IS
+    # FlexAttention.Config, but our AP _testing FlexAttention wrapper uses
+    # `score_mod` internally and doesn't need an externally-built BlockMask.
+    # Returning None lets the trainer pass attention_masks=None as a kwarg,
+    # which tree_flatten then drops before AP's runtime forward receives it.
+    if not hasattr(parallel_model, "get_attention_masks"):
+        parallel_model.get_attention_masks = lambda **kwargs: None
+
 
 def _preserve_moe_attributes(original_model, parallel_model):
     """Preserve MoE attributes (moe_enabled, load_balance_coeff) from original."""
