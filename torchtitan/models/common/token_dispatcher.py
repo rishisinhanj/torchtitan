@@ -13,7 +13,10 @@ import weakref
 
 import spmd_types as spmd
 import torch
-from torch.distributed._functional_collectives import all_to_all_single
+from torch.distributed._functional_collectives import (
+    all_to_all_single,
+    all_to_all_single_autograd,
+)
 from torch.distributed.tensor import DeviceMesh
 
 from torchtitan.config import Configurable
@@ -341,7 +344,11 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
                     torch.compiler, "_is_non_strict_tracing", lambda: False
                 )()
             ) or get_spmd_backend() != "spmd_types":
-                return all_to_all_single(
+                # all_to_all_single (non-autograd) silently drops gradients for this
+                # payload exchange under the partial_dtensor spmd backend -- must use
+                # the autograd-registered variant so backward issues a matching
+                # all-to-all instead of a no-op passthrough.
+                return all_to_all_single_autograd(
                     routed_input_ND,
                     output_splits,
                     input_splits,
@@ -373,7 +380,8 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
                     torch.compiler, "_is_non_strict_tracing", lambda: False
                 )()
             ) or get_spmd_backend() != "spmd_types":
-                return all_to_all_single(
+                # see matching comment in _dispatch_token_exchange
+                return all_to_all_single_autograd(
                     routed_output_RD,
                     input_splits,
                     output_splits,
