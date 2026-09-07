@@ -6,7 +6,10 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import math
+import os
 from typing import Any, cast
+import weakref
 
 import spmd_types as spmd
 import torch
@@ -256,7 +259,8 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
         """
         assert self.ep_mesh is not None
         if (
-            torch.compiler.is_compiling() or torch.compiler._is_non_strict_tracing()
+            torch.compiler.is_compiling()
+            or getattr(torch.compiler, "_is_non_strict_tracing", lambda: False)()
         ) or get_spmd_backend() != "spmd_types":
             return all_to_all_single(
                 num_local_tokens_per_expert_E.view(ep_size, -1),
@@ -313,6 +317,14 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
             output_splits_list,
         )
 
+    def _static_token_exchange_metadata(
+        self,
+        num_local_tokens_per_expert_E: torch.Tensor,
+        ep_size: int,
+    ) -> tuple[torch.Tensor, list[int], list[int]] | None:
+        """Return static count metadata, or None for the normal exchange."""
+        return None
+
     def _dispatch_token_exchange(
         self,
         routed_input_ND: torch.Tensor,
@@ -322,24 +334,28 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
     ) -> torch.Tensor:
         """Launch the dispatch all-to-all that moves routed tokens to experts."""
         assert self.ep_mesh is not None
-        if (
-            torch.compiler.is_compiling() or torch.compiler._is_non_strict_tracing()
-        ) or get_spmd_backend() != "spmd_types":
-            return all_to_all_single(
-                routed_input_ND,
-                output_splits,
-                input_splits,
-                self.ep_mesh,
-            )
+        with torch.profiler.record_function("standard_ep::dispatch_all_to_all"):
+            if (
+                torch.compiler.is_compiling()
+                or getattr(
+                    torch.compiler, "_is_non_strict_tracing", lambda: False
+                )()
+            ) or get_spmd_backend() != "spmd_types":
+                return all_to_all_single(
+                    routed_input_ND,
+                    output_splits,
+                    input_splits,
+                    self.ep_mesh,
+                )
 
-        return spmd.all_to_all(
-            routed_input_ND,
-            pg,
-            src=spmd.V,
-            dst=spmd.V,
-            output_split_sizes=output_splits,
-            input_split_sizes=input_splits,
-        )
+            return spmd.all_to_all(
+                routed_input_ND,
+                pg,
+                src=spmd.V,
+                dst=spmd.V,
+                output_split_sizes=output_splits,
+                input_split_sizes=input_splits,
+            )
 
     def _combine_token_exchange(
         self,
@@ -350,24 +366,28 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
     ) -> torch.Tensor:
         """Launch the combine all-to-all that returns expert outputs to tokens."""
         assert self.ep_mesh is not None
-        if (
-            torch.compiler.is_compiling() or torch.compiler._is_non_strict_tracing()
-        ) or get_spmd_backend() != "spmd_types":
-            return all_to_all_single(
-                routed_output_RD,
-                input_splits,
-                output_splits,
-                self.ep_mesh,
-            )
+        with torch.profiler.record_function("standard_ep::combine_all_to_all"):
+            if (
+                torch.compiler.is_compiling()
+                or getattr(
+                    torch.compiler, "_is_non_strict_tracing", lambda: False
+                )()
+            ) or get_spmd_backend() != "spmd_types":
+                return all_to_all_single(
+                    routed_output_RD,
+                    input_splits,
+                    output_splits,
+                    self.ep_mesh,
+                )
 
-        return spmd.all_to_all(
-            routed_output_RD,
-            pg,
-            src=spmd.V,
-            dst=spmd.V,
-            output_split_sizes=input_splits,
-            input_split_sizes=output_splits,
-        )
+            return spmd.all_to_all(
+                routed_output_RD,
+                pg,
+                src=spmd.V,
+                dst=spmd.V,
+                output_split_sizes=input_splits,
+                input_split_sizes=output_splits,
+            )
 
     def dispatch(
         self,
@@ -441,20 +461,32 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
                 )
 
             with torch.no_grad():
-                num_global_tokens_per_local_expert_EP_e = self._token_count_exchange(
-                    num_local_tokens_per_expert_E,
-                    pg,
-                    ep_size,
+                static_metadata = self._static_token_exchange_metadata(
+                    num_local_tokens_per_expert_E, ep_size
                 )
-                (
-                    num_global_tokens_per_local_expert_E,
-                    input_splits_list,
-                    output_splits_list,
-                ) = self._sync_token_count_exchange(
-                    num_local_tokens_per_expert_E,
-                    num_global_tokens_per_local_expert_EP_e,
-                    ep_size,
-                )
+                if static_metadata is None:
+                    num_global_tokens_per_local_expert_EP_e = (
+                        self._token_count_exchange(
+                            num_local_tokens_per_expert_E,
+                            pg,
+                            ep_size,
+                        )
+                    )
+                    (
+                        num_global_tokens_per_local_expert_E,
+                        input_splits_list,
+                        output_splits_list,
+                    ) = self._sync_token_count_exchange(
+                        num_local_tokens_per_expert_E,
+                        num_global_tokens_per_local_expert_EP_e,
+                        ep_size,
+                    )
+                else:
+                    (
+                        num_global_tokens_per_local_expert_E,
+                        input_splits_list,
+                        output_splits_list,
+                    ) = static_metadata
 
             routed_input_RD = self._dispatch_token_exchange(
                 routed_input_ND,
@@ -616,6 +648,325 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
             routed_output_RD,
         )
         return out_TD
+
+
+_GIN_COMMUNICATORS: weakref.WeakValueDictionary[
+    tuple[tuple[int, ...], int, int, int, int, bool],
+    Any,
+] = weakref.WeakValueDictionary()
+
+
+def close_gin_communicators() -> None:
+    communicators = list(_GIN_COMMUNICATORS.values())
+    _GIN_COMMUNICATORS.clear()
+    for communicator in communicators:
+        if not communicator.closed:
+            communicator.close()
+
+class GINAllToAllTokenDispatcher(AllToAllTokenDispatcher):
+    """GIN payload exchange with dynamic or benchmark-static count metadata."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(AllToAllTokenDispatcher.Config):
+        hidden_dim: int | None = None
+        num_max_tokens_per_rank: int | None = None
+        cta_count: int = 64
+        capacity_factor: float | None = None
+        static_balanced_routing: bool = False
+        steady_state_barrier_elision: bool = False
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        if config.hidden_dim is None:
+            raise ValueError("GIN hidden_dim must be set before construction")
+        if config.num_max_tokens_per_rank is None:
+            raise ValueError(
+                "GIN num_max_tokens_per_rank must be set before construction"
+            )
+        self.hidden_dim = config.hidden_dim
+        if config.capacity_factor is not None and config.capacity_factor < 1.0:
+            raise ValueError("GIN capacity_factor must be at least 1.0")
+        self.num_max_tokens_per_rank = config.num_max_tokens_per_rank
+        self.top_k = config.top_k
+        self.capacity_factor = config.capacity_factor
+        self.static_balanced_routing = config.static_balanced_routing
+        self.steady_state_barrier_elision = (
+            config.steady_state_barrier_elision
+        )
+        if (
+            self.steady_state_barrier_elision
+            and not self.static_balanced_routing
+        ):
+            raise ValueError(
+                "GIN steady_state_barrier_elision requires "
+                "static_balanced_routing"
+            )
+        self.capacity_per_peer = config.num_max_tokens_per_rank * config.top_k
+        self.cta_count = config.cta_count
+        self._gin_communicator = None
+
+    def _static_token_exchange_metadata(
+        self,
+        num_local_tokens_per_expert_E: torch.Tensor,
+        ep_size: int,
+    ) -> tuple[torch.Tensor, list[int], list[int]] | None:
+        if not self.static_balanced_routing:
+            return None
+        if self.num_experts % ep_size != 0:
+            raise ValueError(
+                "static balanced routing requires num_experts divisible by EP size"
+            )
+
+        assignments_per_rank = self.num_max_tokens_per_rank * self.top_k
+        if assignments_per_rank % self.num_experts != 0:
+            raise ValueError(
+                "static balanced routing requires token assignments divisible "
+                "by num_experts"
+            )
+        count_per_expert = assignments_per_rank // self.num_experts
+        local_experts = self.num_experts // ep_size
+        rows_per_peer = count_per_expert * local_experts
+        if rows_per_peer != self.capacity_per_peer:
+            raise ValueError(
+                "static balanced routing requires capacity_per_peer to equal "
+                f"the exact peer rows ({rows_per_peer}), got "
+                f"{self.capacity_per_peer}"
+            )
+        if num_local_tokens_per_expert_E.numel() != self.num_experts:
+            raise ValueError(
+                "static balanced routing received an unexpected expert-count shape"
+            )
+
+        torch._assert_async(
+            torch.all(num_local_tokens_per_expert_E == count_per_expert),
+            "static balanced routing counts do not match round-robin routing",
+        )
+        counts = torch.full(
+            (ep_size * local_experts,),
+            count_per_expert,
+            dtype=num_local_tokens_per_expert_E.dtype,
+            device=num_local_tokens_per_expert_E.device,
+        )
+        splits = [rows_per_peer] * ep_size
+        return counts, splits, splits.copy()
+
+    def init_buffer(self) -> None:
+        if self.ep_mesh is None:
+            return
+        if self.capacity_factor is not None:
+            average_tokens_per_peer = (
+                self.num_max_tokens_per_rank * self.top_k / self.ep_mesh.size()
+            )
+            self.capacity_per_peer = math.ceil(
+                average_tokens_per_peer * self.capacity_factor
+            )
+
+        import torch.distributed as dist
+
+        from torchtitan.experiments.gin_ep.api import (
+            create_communicator,
+            get_unique_id,
+        )
+
+        ep_rank = self.ep_mesh.get_local_rank()
+        ep_size = self.ep_mesh.size()
+        device = torch.cuda.current_device()
+        ep_ranks = tuple(
+            int(rank) for rank in self.ep_mesh.mesh.flatten().tolist()
+        )
+        communicator_key = (
+            ep_ranks,
+            device,
+            self.capacity_per_peer,
+            self.hidden_dim,
+            self.cta_count,
+            self.steady_state_barrier_elision,
+        )
+        cached_communicator = _GIN_COMMUNICATORS.get(communicator_key)
+        if cached_communicator is not None:
+            if cached_communicator.closed:
+                del _GIN_COMMUNICATORS[communicator_key]
+            else:
+                self._gin_communicator = cached_communicator
+                return
+
+        source_rank = ep_ranks[0]
+
+        unique_id = get_unique_id() if ep_rank == 0 else bytes(128)
+        unique_id_tensor = torch.tensor(
+            list(unique_id),
+            dtype=torch.uint8,
+            device=device,
+        )
+        dist.broadcast(
+            unique_id_tensor,
+            src=source_rank,
+            group=self.ep_mesh.get_group(),
+        )
+
+        self._gin_communicator = create_communicator(
+            bytes(unique_id_tensor.cpu().tolist()),
+            rank=ep_rank,
+            world_size=ep_size,
+            device=device,
+        )
+        self._gin_communicator.set_steady_state_barrier_elision(
+            self.steady_state_barrier_elision
+        )
+        _GIN_COMMUNICATORS[communicator_key] = self._gin_communicator
+
+    def _ensure_gin_buffers(self, tensor: torch.Tensor) -> None:
+        assert self.ep_mesh is not None
+        assert self._gin_communicator is not None
+
+        if tensor.dim() != 2 or tensor.shape[1] != self.hidden_dim:
+            raise ValueError(
+                "GIN payloads must have shape "
+                f"(tokens, {self.hidden_dim}), got {tuple(tensor.shape)}"
+            )
+
+        buffer_bytes = (
+            self.ep_mesh.size()
+            * self.capacity_per_peer
+            * self.hidden_dim
+            * tensor.element_size()
+        )
+        if self._gin_communicator.symmetric_buffers_allocated:
+            if buffer_bytes > self._gin_communicator.symmetric_buffer_bytes:
+                raise ValueError(
+                    "GIN communicator buffer is smaller than the requested "
+                    f"capacity ({self._gin_communicator.symmetric_buffer_bytes} "
+                    f"< {buffer_bytes} bytes)"
+                )
+            if not self._gin_communicator.device_communicator_created:
+                self._gin_communicator.create_device_communicator(
+                    cta_count=self.cta_count
+                )
+            return
+
+        self._gin_communicator.allocate_symmetric_buffers(
+            bytes=buffer_bytes
+        )
+        self._gin_communicator.create_device_communicator(
+            cta_count=self.cta_count
+        )
+
+    def _gin_variable_all_to_all(
+        self,
+        tensor: torch.Tensor,
+        *,
+        operation: str,
+        input_splits: list[int],
+        output_splits: list[int],
+    ) -> torch.Tensor:
+        assert self.ep_mesh is not None
+        assert self._gin_communicator is not None
+
+        if (
+            torch.compiler.is_compiling()
+            or getattr(
+                torch.compiler,
+                "_is_non_strict_tracing",
+                lambda: False,
+            )()
+            or spmd.is_type_checking()
+        ):
+            raise RuntimeError(
+                "GIN token dispatch currently supports eager execution only"
+            )
+        if len(input_splits) != self.ep_mesh.size():
+            raise ValueError("input_splits must contain one entry per EP rank")
+        if len(output_splits) != self.ep_mesh.size():
+            raise ValueError("output_splits must contain one entry per EP rank")
+        if any(count > self.capacity_per_peer for count in input_splits):
+            raise ValueError(
+                "GIN input split exceeds configured per-peer capacity "
+                f"{self.capacity_per_peer}"
+            )
+        if any(count > self.capacity_per_peer for count in output_splits):
+            raise ValueError(
+                "GIN output split exceeds configured per-peer capacity "
+                f"{self.capacity_per_peer}"
+            )
+
+        self._ensure_gin_buffers(tensor)
+
+        if os.environ.get("GIN_LOG_PAYLOAD_SIZE", "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }:
+            row_bytes = self.hidden_dim * tensor.element_size()
+            fixed_bytes_per_peer = self.capacity_per_peer * row_bytes
+            fixed_exchange_bytes = self.ep_mesh.size() * fixed_bytes_per_peer
+            actual_send_bytes = sum(input_splits) * row_bytes
+            actual_receive_bytes = sum(output_splits) * row_bytes
+            device_info = self._gin_communicator.device_communicator_info()
+            lsa_peers = int(device_info["lsa_size"])
+            remote_peers = self.ep_mesh.size() - lsa_peers
+            print(
+                "[GIN payload] "
+                f"operation={operation} "
+                f"ep_rank={self.ep_mesh.get_local_rank()} "
+                f"world_size={self.ep_mesh.size()} "
+                f"dtype={tensor.dtype} "
+                f"row_bytes={row_bytes} "
+                f"actual_send_rows={sum(input_splits)} "
+                f"actual_receive_rows={sum(output_splits)} "
+                f"actual_send_bytes={actual_send_bytes} "
+                f"actual_receive_bytes={actual_receive_bytes} "
+                f"capacity_rows_per_peer={self.capacity_per_peer} "
+                f"fixed_bytes_per_peer={fixed_bytes_per_peer} "
+                f"fixed_exchange_bytes={fixed_exchange_bytes} "
+                f"padding_bytes={fixed_exchange_bytes - actual_send_bytes} "
+                f"lsa_peers_including_self={lsa_peers} "
+                f"lsa_bytes={lsa_peers * fixed_bytes_per_peer} "
+                f"remote_gin_peers={remote_peers} "
+                f"remote_gin_bytes={remote_peers * fixed_bytes_per_peer}",
+                flush=True,
+            )
+
+        from torchtitan.experiments.gin_ep.api import variable_all_to_all
+
+        return variable_all_to_all(
+            self._gin_communicator,
+            tensor,
+            input_splits=input_splits,
+            output_splits=output_splits,
+            capacity_per_peer=self.capacity_per_peer,
+        )
+
+    def _dispatch_token_exchange(
+        self,
+        routed_input_ND: torch.Tensor,
+        pg,
+        output_splits: list[int],
+        input_splits: list[int],
+    ) -> torch.Tensor:
+        del pg
+        with torch.profiler.record_function("gin_ep::dispatch_all_to_all"):
+            return self._gin_variable_all_to_all(
+                routed_input_ND,
+                operation="dispatch",
+                input_splits=input_splits,
+                output_splits=output_splits,
+            )
+
+    def _combine_token_exchange(
+        self,
+        routed_output_RD: torch.Tensor,
+        pg,
+        input_splits: list[int],
+        output_splits: list[int],
+    ) -> torch.Tensor:
+        del pg
+        with torch.profiler.record_function("gin_ep::combine_all_to_all"):
+            return self._gin_variable_all_to_all(
+                routed_output_RD,
+                operation="combine",
+                input_splits=output_splits,
+                output_splits=input_splits,
+            )
 
 
 class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
@@ -1196,6 +1547,7 @@ def update_ep_token_dispatcher_config(model_config: Any, config: Any) -> None:
             token_dispatcher_cfg,
             (
                 DeepEPTokenDispatcher.Config,
+                GINAllToAllTokenDispatcher.Config,
                 HybridEPTokenDispatcher.Config,
                 MinimalAsyncEPTokenDispatcher.Config,
             ),

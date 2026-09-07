@@ -50,6 +50,7 @@ from torchtitan.distributed.cudagraph import (
 )
 from torchtitan.models.common.attention import FlexAttention
 from torchtitan.models.common.token_dispatcher import (
+    close_gin_communicators,
     HybridEPTokenDispatcher,
     LocalTokenDispatcher,
     MinimalAsyncEPTokenDispatcher,
@@ -848,13 +849,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     accumulated_loss.add_(detached_loss)
 
         with sl.log_trace_span("optim"):
-            grad_norm = dist_utils.clip_grad_norm_(
-                [p for m in self.model_parts for p in m.parameters()],
-                self.config.training.max_norm,
-                foreach=True,
-                pp_mesh=parallel_dims.get_optional_mesh("pp"),
-                ep_enabled=parallel_dims.ep_enabled,
-            )
+            if os.environ.get("GIN_PROFILE_SKIP_FSDP") == "1":
+                grad_norm = torch.zeros((), device=self.device)
+            else:
+                grad_norm = dist_utils.clip_grad_norm_(
+                    [p for m in self.model_parts for p in m.parameters()],
+                    self.config.training.max_norm,
+                    foreach=True,
+                    pp_mesh=parallel_dims.get_optional_mesh("pp"),
+                    ep_enabled=parallel_dims.ep_enabled,
+                )
             # Only the last PP stage owns the loss. First combine its DP/CP
             # replicas, then propagate the result across PP. TP replicas have
             # identical loss values, and grad_norm is already world-reduced by
@@ -885,8 +889,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 f"step {self.step}. Stopping training before the optimizer update.",
             )
             self.checkpointer.maybe_wait_for_staging()
-            self.optimizers.step()
-            self.lr_schedulers.step()
+            if os.environ.get("GIN_PROFILE_SKIP_OPTIMIZER") != "1":
+                self.optimizers.step()
+                self.lr_schedulers.step()
 
         # log metrics
         if not should_log:
@@ -1021,3 +1026,4 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             self.checkpointer.close()
         if hasattr(self, "metrics_processor") and self.metrics_processor:
             self.metrics_processor.close()
+        close_gin_communicators()

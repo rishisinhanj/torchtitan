@@ -44,6 +44,7 @@ from torchtitan.models.common.rope import RoPE
 from torchtitan.models.common.token_dispatcher import (
     AllToAllTokenDispatcher,
     DeepEPTokenDispatcher,
+    GINAllToAllTokenDispatcher,
     HybridEPTokenDispatcher,
     LocalTokenDispatcher,
     MinimalAsyncEPTokenDispatcher,
@@ -373,6 +374,7 @@ def make_token_dispatcher_config(
     - "deepep": Uses DeepEP custom kernels for H100/NVLink Switch
     - "hybridep": Uses HybridEP with TMA optimization for GB200/NVLink72
     - "minimal_async_ep": Uses MinimalAsyncEP for constrained DP>=EP
+    - "gin": Uses Stage 2 GDA+LSA for fixed-capacity payload exchange
 
     DeepEP/HybridEP requires installation:
     https://github.com/deepseek-ai/DeepEP
@@ -411,6 +413,15 @@ def make_token_dispatcher_config(
             top_k=top_k,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
         )
+    elif comm_backend == "gin":
+        if hidden_dim is None:
+            raise ValueError("hidden_dim is required for the GIN backend")
+        return GINAllToAllTokenDispatcher.Config(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_dim=hidden_dim,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+        )
     elif comm_backend == "standard":
         return AllToAllTokenDispatcher.Config(
             num_experts=num_experts,
@@ -419,7 +430,8 @@ def make_token_dispatcher_config(
     else:
         raise ValueError(
             f"Unknown comm_backend: '{comm_backend}'. "
-            "Must be one of 'standard', 'deepep', 'hybridep', 'minimal_async_ep'."
+            "Must be one of 'standard', 'deepep', 'hybridep', "
+            "'minimal_async_ep', 'gin'."
         )
 
 
