@@ -164,6 +164,9 @@ class Profiler(Configurable):
         This is used to configure torch.profiler.schedule.
         """
 
+        with_stack: bool = False
+        """Whether profiler events include Python source stacks."""
+
         enable_memory_snapshot: bool = False
         """Whether to dump memory snapshot."""
 
@@ -347,6 +350,7 @@ class Profiler(Configurable):
             ),
             on_trace_ready=trace_handler,
             record_shapes=True,
+            with_stack=cfg.with_stack,
         )
         torch_profiler.__enter__()
         torch_profiler.step_num = global_step

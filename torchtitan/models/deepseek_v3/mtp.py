@@ -12,7 +12,10 @@ from typing import Any
 import spmd_types as spmd
 import torch
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import DataParallelMeshDims
+try:
+    from torch.distributed.fsdp import DataParallelMeshDims
+except ImportError:
+    from torchtitan.distributed.fsdp import DataParallelMeshDims
 
 from torchtitan.components.loss import (
     BaseLoss,

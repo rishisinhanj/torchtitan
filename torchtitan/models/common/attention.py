@@ -91,6 +91,11 @@ AttentionMasksType = (
 
 @spmd.no_typecheck(out_types=spmd.PartitionSpec(("dp", "cp"), "tp", None))
 def varlen_attn(*args, **kwargs):
+    # Older PyTorch varlen attention derives the default scale internally and
+    # does not expose newer optional keyword arguments.
+    kwargs.pop("scale", None)
+    kwargs.pop("enable_gqa", None)
+    kwargs.pop("window_size", None)
     return _varlen_attn(*args, **kwargs)
 
 
@@ -585,6 +590,9 @@ _compiled_create_block_mask = torch.compile(create_block_mask)
 
 def create_attention_mask(*args, **kwargs):
     """Create an attention mask using compiled create_block_mask."""
+    # PyTorch builds before separate full-block iteration ignore this optional
+    # mask-construction optimization.
+    kwargs.pop("separate_full_blocks", None)
     return _compiled_create_block_mask(*args, **kwargs)
 
 

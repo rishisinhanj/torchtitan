@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
+
 from torchtitan.config import (
     CompileConfig,
     ParallelismConfig,
@@ -48,6 +50,9 @@ def parallelize_deepseekv3(
             compile_config=compile_config,
             parallel_dims=parallel_dims,
         )
+
+    if os.environ.get("GIN_PROFILE_SKIP_FSDP") == "1":
+        return model
 
     if parallelism.spmd_backend == "spmd_types":
         dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)

@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -12,8 +13,7 @@ from torch.distributed._composable.fsdp import FSDPModule
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
-    DataParallelMeshDims,
-    fully_shard,
+    fully_shard as _torch_fully_shard,
     MixedPrecisionPolicy,
 )
 from torch.distributed.tensor import Shard
@@ -23,6 +23,29 @@ from torchtitan.tools.logging import logger
 
 if TYPE_CHECKING:
     from torchtitan.models.common.decoder import Decoder
+
+
+try:
+    from torch.distributed.fsdp import DataParallelMeshDims
+
+    _FSDP_HAS_DP_MESH_DIMS = True
+except ImportError:
+    _FSDP_HAS_DP_MESH_DIMS = False
+
+    @dataclass(frozen=True)
+    class DataParallelMeshDims:
+        shard: str | tuple[str, ...]
+        replicate: str | None = None
+
+
+def fully_shard(module, *args, **kwargs):
+    if not _FSDP_HAS_DP_MESH_DIMS:
+        dp_mesh_dims = kwargs.pop("dp_mesh_dims", None)
+        if dp_mesh_dims is not None:
+            raise RuntimeError(
+                "This PyTorch build does not support DataParallelMeshDims"
+            )
+    return _torch_fully_shard(module, *args, **kwargs)
 
 
 _DENSE_STORAGE_AXES = ["dp_replicate", "dp_shard", "cp", "tp"]
@@ -316,48 +339,63 @@ def apply_fsdp_to_decoder(
                 )
             else:
                 # ep_degree > 1: per-param mesh
-                from torch.distributed.fsdp._fully_shard._fsdp_common import (
-                    FSDPMeshInfo,
-                    ShardPlacementResult,
-                )
-                from torch.distributed.fsdp._fully_shard._fsdp_init import (
-                    _get_mesh_info,
-                )
-
                 assert edp_mesh is not None
-
-                # Delegate to FSDP2's mesh-info builder. When mesh_dims is set
-                # it extracts and FLATTENS the DP submesh from the full SPMD
-                # mesh.
-                edp_mesh_info = _get_mesh_info(edp_mesh, edp_mesh_dims)
-                dp_mesh_info = _get_mesh_info(dp_mesh, dp_mesh_dims)
-                # _get_mesh_info is typed to the DataParallelMeshInfo base; with
-                # a shard dim it always yields FSDPMeshInfo/HSDPMeshInfo.
-                assert isinstance(edp_mesh_info, FSDPMeshInfo)
-                assert isinstance(dp_mesh_info, FSDPMeshInfo)
-
-                def _shard_placement_fn(
-                    param: nn.Parameter,
-                    _expert_params: set = expert_params,
-                    _expert_placement: Shard = expert_shard_placement,
-                    _edp_mesh_info: FSDPMeshInfo = edp_mesh_info,
-                    _dp_mesh_info: FSDPMeshInfo = dp_mesh_info,
-                ) -> ShardPlacementResult:
-                    if param in _expert_params:
-                        return ShardPlacementResult(
-                            placement=_expert_placement, mesh_info=_edp_mesh_info
+                try:
+                    from torch.distributed.fsdp._fully_shard._fsdp_common import (
+                        FSDPMeshInfo,
+                        ShardPlacementResult,
+                    )
+                    from torch.distributed.fsdp._fully_shard._fsdp_init import (
+                        _get_mesh_info,
+                    )
+                except ImportError:
+                    # Older PyTorch builds do not support selecting an FSDP
+                    # mesh per parameter. The profile configuration uses
+                    # efsdp=1, so routed experts are already fully partitioned
+                    # by EP and need no additional FSDP sharding.
+                    if edp_mesh["efsdp"].size() != 1:
+                        raise RuntimeError(
+                            "This PyTorch build requires efsdp=1 for expert "
+                            "parallel models"
                         )
-                    else:
+                    fully_shard(
+                        transformer_block,
+                        **fsdp_config,
+                        reshard_after_forward=reshard_after_forward,
+                        ignored_params=expert_params,
+                    )
+                else:
+                    # Delegate to FSDP2's mesh-info builder. When mesh_dims is
+                    # set it extracts and flattens the DP submesh from the full
+                    # SPMD mesh.
+                    edp_mesh_info = _get_mesh_info(edp_mesh, edp_mesh_dims)
+                    dp_mesh_info = _get_mesh_info(dp_mesh, dp_mesh_dims)
+                    assert isinstance(edp_mesh_info, FSDPMeshInfo)
+                    assert isinstance(dp_mesh_info, FSDPMeshInfo)
+
+                    def _shard_placement_fn(
+                        param: nn.Parameter,
+                        _expert_params: set = expert_params,
+                        _expert_placement: Shard = expert_shard_placement,
+                        _edp_mesh_info: FSDPMeshInfo = edp_mesh_info,
+                        _dp_mesh_info: FSDPMeshInfo = dp_mesh_info,
+                    ) -> ShardPlacementResult:
+                        if param in _expert_params:
+                            return ShardPlacementResult(
+                                placement=_expert_placement,
+                                mesh_info=_edp_mesh_info,
+                            )
                         return ShardPlacementResult(
-                            placement=Shard(0), mesh_info=_dp_mesh_info
+                            placement=Shard(0),
+                            mesh_info=_dp_mesh_info,
                         )
 
-                fully_shard(
-                    transformer_block,
-                    **fsdp_config,
-                    reshard_after_forward=reshard_after_forward,
-                    shard_placement_fn=_shard_placement_fn,
-                )
+                    fully_shard(
+                        transformer_block,
+                        **fsdp_config,
+                        reshard_after_forward=reshard_after_forward,
+                        shard_placement_fn=_shard_placement_fn,
+                    )
         else:
             fully_shard(
                 transformer_block,
