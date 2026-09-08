@@ -134,6 +134,12 @@ def build_features_test_list() -> list[OverrideDefinitions]:
             test_name="pp_dp_tp",
             ngpu=8,
             use_real_pg=True,
+            # TODO: Reproducibly hangs on ROCm ~10-22min into the run with an
+            # NCCL collective timeout (`Operation timed out after ~600s`) on a
+            # varying process group/rank each time, verified on real MI350X
+            # hardware (3/3 repro attempts, no GPU/XGMI/ECC errors observed).
+            # Re-enable once root-caused; not yet isolated to a specific op.
+            skip_rocm_test=True,
         ),
         OverrideDefinitions(
             configs=[recipes.llama3_debugmodel_fsdp2_tp2_pp2_compile],
