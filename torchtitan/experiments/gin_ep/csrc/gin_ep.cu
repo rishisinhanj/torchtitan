@@ -4,12 +4,25 @@
 #define NCCL_HOSTLIB_ONLY
 #include <nccl_device.h>
 #include <torch/extension.h> // pybind integration
+#include <algorithm>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <tuple>
+#include <vector>
 
 namespace py = pybind11;
+
+struct GinPhaseTimingRecord {
+  uint64_t operation;
+  uint64_t start;
+  uint64_t phase1;
+  uint64_t phase2;
+  uint64_t phase3;
+  uint64_t end;
+  uint64_t peer_path_complete;
+};
 
 extern "C" hipError_t gin_ep_launch_hybrid_all_to_all(
     ncclWindow_t send_window,
@@ -19,6 +32,10 @@ extern "C" hipError_t gin_ep_launch_hybrid_all_to_all(
     int cta_count,
     uint64_t signal_sequence,
     uint64_t* signal_base,
+    GinPhaseTimingRecord* timing_records,
+    uint64_t timing_capacity,
+    uint64_t timing_launch,
+    uint64_t timing_operation,
     hipStream_t stream);
 
 // If RCCL fails, throw a Python-visible exception.
@@ -130,6 +147,9 @@ class GinCommunicator final {
       if (signal_base_ != nullptr) {
         (void)hipFree(signal_base_);
       }
+      if (phase_timing_records_ != nullptr) {
+        (void)hipFree(phase_timing_records_);
+      }
     }
 
     if (can_restore) {
@@ -195,6 +215,9 @@ class GinCommunicator final {
       if (signal_base_ != nullptr) {
         (void)hipFree(signal_base_);
       }
+      if (phase_timing_records_ != nullptr) {
+        (void)hipFree(phase_timing_records_);
+      }
 
       if (result == ncclSuccess) {
         record_failure(ncclCommDestroy(comm), "ncclCommDestroy");
@@ -221,6 +244,8 @@ class GinCommunicator final {
     device_cta_count_ = 0;
     signal_base_ = nullptr;
     launch_sequence_ = 0;
+    phase_timing_records_ = nullptr;
+    phase_timing_launch_count_ = 0;
 
     check_nccl(
         result,
@@ -272,6 +297,18 @@ class GinCommunicator final {
     output["railed_gin_type"] =
         static_cast<int>(properties.railedGinType);
     return output;
+  }
+
+  void configure_phase_timing(bool enabled, uint64_t capacity) {
+    TORCH_CHECK(
+        !device_comm_created_,
+        "phase timing must be configured before device communicator creation");
+    TORCH_CHECK(
+        capacity > 0,
+        "phase timing capacity must be positive");
+    phase_timing_enabled_ = enabled;
+    phase_timing_capacity_ = capacity;
+    phase_timing_launch_count_ = 0;
   }
 
   void create_device_communicator(int cta_count) {
@@ -338,11 +375,59 @@ class GinCommunicator final {
       check_hip(allocation_result, "hipMalloc(signal_base)");
     }
 
+    GinPhaseTimingRecord* phase_timing_records = nullptr;
+    int wall_clock_rate_khz = 0;
+    if (phase_timing_enabled_) {
+      TORCH_CHECK(
+          phase_timing_capacity_ <=
+              std::numeric_limits<size_t>::max() /
+              static_cast<size_t>(cta_count) /
+              sizeof(GinPhaseTimingRecord),
+          "phase timing allocation is too large");
+      const size_t timing_record_count =
+          static_cast<size_t>(phase_timing_capacity_) * cta_count;
+      const hipError_t timing_allocation_result = hipMalloc(
+          reinterpret_cast<void**>(&phase_timing_records),
+          timing_record_count * sizeof(GinPhaseTimingRecord));
+      if (timing_allocation_result != hipSuccess) {
+        (void)hipFree(signal_base);
+        (void)ncclDevCommDestroy(comm_, &device_comm);
+        check_hip(
+            timing_allocation_result,
+            "hipMalloc(phase_timing_records)");
+      }
+      const hipError_t timing_memset_result = hipMemset(
+          phase_timing_records,
+          0,
+          timing_record_count * sizeof(GinPhaseTimingRecord));
+      if (timing_memset_result != hipSuccess) {
+        (void)hipFree(phase_timing_records);
+        (void)hipFree(signal_base);
+        (void)ncclDevCommDestroy(comm_, &device_comm);
+        check_hip(
+            timing_memset_result,
+            "hipMemset(phase_timing_records)");
+      }
+      const hipError_t clock_rate_result = hipDeviceGetAttribute(
+          &wall_clock_rate_khz,
+          hipDeviceAttributeWallClockRate,
+          device_);
+      if (clock_rate_result != hipSuccess) {
+        (void)hipFree(phase_timing_records);
+        (void)hipFree(signal_base);
+        (void)ncclDevCommDestroy(comm_, &device_comm);
+        check_hip(clock_rate_result, "hipDeviceAttributeWallClockRate");
+      }
+    }
+
     device_comm_ = device_comm;
     signal_base_ = signal_base;
+    phase_timing_records_ = phase_timing_records;
+    wall_clock_rate_khz_ = wall_clock_rate_khz;
     device_comm_created_ = true;
     device_cta_count_ = cta_count;
     launch_sequence_ = 0;
+    phase_timing_launch_count_ = 0;
   }
 
   void destroy_device_communicator() {
@@ -366,12 +451,20 @@ class GinCommunicator final {
     }
     check_nccl(result, "ncclDevCommDestroy");
     check_hip(hipFree(signal_base_), "hipFree(signal_base)");
+    if (phase_timing_records_ != nullptr) {
+      check_hip(
+          hipFree(phase_timing_records_),
+          "hipFree(phase_timing_records)");
+    }
 
     device_comm_ = {};
     device_comm_created_ = false;
     device_cta_count_ = 0;
     signal_base_ = nullptr;
     launch_sequence_ = 0;
+    phase_timing_records_ = nullptr;
+    phase_timing_launch_count_ = 0;
+    wall_clock_rate_khz_ = 0;
   }
 
   void set_steady_state_barrier_elision(bool enabled) {
@@ -414,19 +507,137 @@ class GinCommunicator final {
     return output;
   }
 
-  torch::Tensor fixed_all_to_all(const torch::Tensor& input) {
-    return fixed_all_to_all_impl(input, torch::empty_like(input));
+  py::dict phase_timing_info() const {
+    py::dict output;
+    output["enabled"] = phase_timing_enabled_;
+    output["capacity"] = phase_timing_capacity_;
+    output["launch_count"] = phase_timing_launch_count_;
+    output["captured_launch_count"] =
+        std::min(phase_timing_launch_count_, phase_timing_capacity_);
+    output["dropped_launch_count"] =
+        phase_timing_launch_count_ > phase_timing_capacity_
+        ? phase_timing_launch_count_ - phase_timing_capacity_
+        : 0;
+    output["wall_clock_rate_khz"] = wall_clock_rate_khz_;
+    return output;
+  }
+
+  py::list phase_timings() {
+    TORCH_CHECK(
+        phase_timing_enabled_,
+        "phase timing is not enabled for this communicator");
+    TORCH_CHECK(
+        phase_timing_records_ != nullptr,
+        "device communicator must be created before reading phase timings");
+    TORCH_CHECK(
+        wall_clock_rate_khz_ > 0,
+        "invalid device wall clock rate");
+
+    HipDeviceGuard device_guard(device_);
+    if (completion_event_ != nullptr) {
+      check_hip(
+          hipEventSynchronize(completion_event_),
+          "hipEventSynchronize");
+    }
+
+    const uint64_t launch_count =
+        std::min(phase_timing_launch_count_, phase_timing_capacity_);
+    const size_t record_count =
+        static_cast<size_t>(launch_count) * device_cta_count_;
+    std::vector<GinPhaseTimingRecord> records(record_count);
+    if (record_count != 0) {
+      check_hip(
+          hipMemcpy(
+              records.data(),
+              phase_timing_records_,
+              record_count * sizeof(GinPhaseTimingRecord),
+              hipMemcpyDeviceToHost),
+          "hipMemcpy(phase_timing_records)");
+    }
+
+    const double cycles_per_us =
+        static_cast<double>(wall_clock_rate_khz_) * 1e-3;
+    auto elapsed_us = [cycles_per_us](uint64_t start, uint64_t end) {
+      return static_cast<double>(end - start) / cycles_per_us;
+    };
+
+    py::list output;
+    for (uint64_t launch = 0; launch < launch_count; ++launch) {
+      const size_t base =
+          static_cast<size_t>(launch) * device_cta_count_;
+      const GinPhaseTimingRecord& scale_out = records[base];
+      double scale_up_entry_barrier_max_us = 0.0;
+      double scale_up_copy_max_us = 0.0;
+      double scale_up_exit_barrier_max_us = 0.0;
+      double scale_up_cta_max_us = 0.0;
+      for (int cta = 1; cta < device_cta_count_; ++cta) {
+        const GinPhaseTimingRecord& scale_up = records[base + cta];
+        scale_up_entry_barrier_max_us = std::max(
+            scale_up_entry_barrier_max_us,
+            elapsed_us(scale_up.start, scale_up.phase1));
+        scale_up_copy_max_us = std::max(
+            scale_up_copy_max_us,
+            elapsed_us(scale_up.phase1, scale_up.phase2));
+        scale_up_exit_barrier_max_us = std::max(
+            scale_up_exit_barrier_max_us,
+            elapsed_us(scale_up.phase2, scale_up.phase3));
+        scale_up_cta_max_us = std::max(
+            scale_up_cta_max_us,
+            elapsed_us(scale_up.start, scale_up.end));
+      }
+
+      const double scale_out_total_us =
+          elapsed_us(scale_out.start, scale_out.end);
+      py::dict row;
+      row["launch"] = launch;
+      row["operation"] = scale_out.operation;
+      row["scale_out_setup_us"] =
+          elapsed_us(scale_out.start, scale_out.phase1);
+      row["scale_out_put_issue_us"] =
+          elapsed_us(scale_out.phase1, scale_out.phase2);
+      row["scale_out_signal_wait_us"] =
+          elapsed_us(scale_out.phase2, scale_out.phase3);
+      row["scale_out_flush_us"] =
+          elapsed_us(scale_out.phase3, scale_out.end);
+      row["scale_out_total_us"] = scale_out_total_us;
+      row["scale_up_entry_barrier_max_us"] =
+          scale_up_entry_barrier_max_us;
+      row["scale_up_copy_max_us"] = scale_up_copy_max_us;
+      row["scale_up_exit_barrier_max_us"] =
+          scale_up_exit_barrier_max_us;
+      row["scale_up_cta_max_us"] = scale_up_cta_max_us;
+      row["overlapped_phase_max_us"] =
+          std::max(scale_out_total_us, scale_up_cta_max_us);
+      row["critical_path"] =
+          scale_out.peer_path_complete != 0 ? "scale_out" : "scale_up";
+      output.append(std::move(row));
+    }
+    return output;
+  }
+
+  torch::Tensor fixed_all_to_all(
+      const torch::Tensor& input,
+      uint64_t operation) {
+    return fixed_all_to_all_impl(
+        input,
+        torch::empty_like(input),
+        operation);
   }
 
   torch::Tensor fixed_all_to_all_out(
       const torch::Tensor& input,
-      torch::Tensor output) {
-    return fixed_all_to_all_impl(input, std::move(output));
+      torch::Tensor output,
+      uint64_t operation) {
+    return fixed_all_to_all_impl(
+        input,
+        std::move(output),
+        operation);
   }
 
   torch::Tensor fixed_all_to_all_impl(
       const torch::Tensor& input,
-      torch::Tensor output) {
+      torch::Tensor output,
+      uint64_t operation) {
     TORCH_CHECK(
         comm_ != nullptr,
         "cannot run all-to-all on a closed communicator");
@@ -504,8 +715,15 @@ class GinCommunicator final {
             device_cta_count_,
             steady_state_barrier_elision_ ? launch_sequence_++ : 0,
             signal_base_,
+            phase_timing_records_,
+            phase_timing_capacity_,
+            phase_timing_launch_count_,
+            operation,
             stream),
         "HybridAlltoAllKernel launch");
+    if (phase_timing_enabled_) {
+      ++phase_timing_launch_count_;
+    }
 
     check_hip(
         hipMemcpyAsync(
@@ -754,6 +972,11 @@ class GinCommunicator final {
   uint64_t* signal_base_ = nullptr;
   uint64_t launch_sequence_ = 0;
   bool steady_state_barrier_elision_ = false;
+  GinPhaseTimingRecord* phase_timing_records_ = nullptr;
+  uint64_t phase_timing_capacity_ = 2048;
+  uint64_t phase_timing_launch_count_ = 0;
+  int wall_clock_rate_khz_ = 0;
+  bool phase_timing_enabled_ = false;
   size_t symmetric_buffer_bytes_ = 0;
   bool symmetric_buffers_allocated_ = false;
   hipEvent_t completion_event_ = nullptr;
@@ -798,6 +1021,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
           &GinCommunicator::set_steady_state_barrier_elision,
           py::arg("enabled"))
       .def(
+          "configure_phase_timing",
+          &GinCommunicator::configure_phase_timing,
+          py::arg("enabled"),
+          py::arg("capacity") = 2048)
+      .def("phase_timing_info", &GinCommunicator::phase_timing_info)
+      .def("phase_timings", &GinCommunicator::phase_timings)
+      .def(
           "allocate_symmetric_buffers",
           &GinCommunicator::allocate_symmetric_buffers,
           py::arg("bytes"))
@@ -807,12 +1037,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def(
           "fixed_all_to_all",
           &GinCommunicator::fixed_all_to_all,
-          py::arg("input"))
+          py::arg("input"),
+          py::arg("operation") = 0)
       .def(
           "fixed_all_to_all_out",
           &GinCommunicator::fixed_all_to_all_out,
           py::arg("input"),
-          py::arg("output"))
+          py::arg("output"),
+          py::arg("operation") = 0)
       .def(
           "device_communicator_info",
           &GinCommunicator::device_communicator_info)

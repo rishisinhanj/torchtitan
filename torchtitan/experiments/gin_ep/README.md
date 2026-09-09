@@ -225,6 +225,26 @@ the matching kernel without racing the late rank's signal read. This option is
 experimental, requires static balanced routing, and assumes every EP rank
 launches the same dispatch/combine sequence on one ordered stream.
 
+## Profile scale-up and scale-out phases
+
+Set `GIN_PROFILE_PHASE_TIMING=1` to add device-side GPU-global
+`s_memrealtime` timestamps inside the unchanged hybrid kernel. CTA 0 records
+scale-out setup, GDA put issue, remote signal wait, and flush. The LSA CTAs
+record scale-up entry barrier, local copy, and exit barrier. Because both paths
+remain in the same kernel, this preserves their normal overlap.
+
+`GIN_PROFILE_PHASE_TIMING_CAPACITY` controls the maximum number of launches
+retained per rank and defaults to 2048. The profile runner writes
+`phase-timings-rank*-comm*.csv` at shutdown. Running
+`scripts/analyze_torchtitan_gin_profile.py` additionally produces
+`phase-timings.csv` and `phase-timing-summary.csv`, split into dispatch/combine
+forward/backward operations with scale-up versus scale-out critical-path
+attribution.
+
+Phase timing is disabled by default because the timestamp boundaries add a
+small number of conditional CTA synchronizations. Use it for attribution, not
+for final throughput numbers.
+
 ## Run the tests
 
 ### CPU packing tests

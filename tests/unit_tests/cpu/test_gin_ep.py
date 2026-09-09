@@ -6,7 +6,15 @@ from torchtitan.experiments.gin_ep.api import variable_all_to_all
 class _FakeCommunicator:
     world_size = 2
 
-    def fixed_all_to_all(self, input: torch.Tensor) -> torch.Tensor:
+    def __init__(self) -> None:
+        self.operations: list[int] = []
+
+    def fixed_all_to_all(
+        self,
+        input: torch.Tensor,
+        operation: int = 0,
+    ) -> torch.Tensor:
+        self.operations.append(operation)
         return input.flip(0)
 
 
@@ -23,6 +31,7 @@ def test_variable_all_to_all_balanced_fast_path_and_backward() -> None:
         input_splits=[2, 2],
         output_splits=[2, 2],
         capacity_per_peer=2,
+        operation="dispatch",
     )
 
     torch.testing.assert_close(
@@ -34,6 +43,7 @@ def test_variable_all_to_all_balanced_fast_path_and_backward() -> None:
         input.grad,
         torch.tensor([[3.0], [4.0], [1.0], [2.0]]),
     )
+    assert communicator.operations == [1, 3]
 
 
 def test_variable_all_to_all_packing_and_backward() -> None:

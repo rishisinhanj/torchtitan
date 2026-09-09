@@ -5,9 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 from abc import ABC, abstractmethod
+import csv
 from dataclasses import dataclass
 import math
 import os
+from pathlib import Path
 from typing import Any, cast
 import weakref
 
@@ -659,7 +661,7 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
 
 
 _GIN_COMMUNICATORS: weakref.WeakValueDictionary[
-    tuple[tuple[int, ...], int, int, int, int, bool],
+    tuple[tuple[int, ...], int, int, int, int, bool, bool, int],
     Any,
 ] = weakref.WeakValueDictionary()
 
@@ -667,9 +669,50 @@ _GIN_COMMUNICATORS: weakref.WeakValueDictionary[
 def close_gin_communicators() -> None:
     communicators = list(_GIN_COMMUNICATORS.values())
     _GIN_COMMUNICATORS.clear()
-    for communicator in communicators:
-        if not communicator.closed:
-            communicator.close()
+    timing_dir = os.environ.get("GIN_PHASE_TIMING_DIR")
+    first_error: Exception | None = None
+    for index, communicator in enumerate(communicators):
+        if communicator.closed:
+            continue
+        try:
+            timing_info = dict(communicator.phase_timing_info())
+            if (
+                timing_dir
+                and timing_info["enabled"]
+                and communicator.device_communicator_created
+            ):
+                rows = [dict(row) for row in communicator.phase_timings()]
+                for row in rows:
+                    row["rank"] = communicator.rank
+                    row["captured_launch_count"] = timing_info[
+                        "captured_launch_count"
+                    ]
+                    row["dropped_launch_count"] = timing_info[
+                        "dropped_launch_count"
+                    ]
+                    row["wall_clock_rate_khz"] = timing_info[
+                        "wall_clock_rate_khz"
+                    ]
+                output_dir = Path(timing_dir)
+                output_dir.mkdir(parents=True, exist_ok=True)
+                output_path = output_dir / (
+                    f"phase-timings-rank{communicator.rank}-comm{index}.csv"
+                )
+                if rows:
+                    with output_path.open("w", newline="") as handle:
+                        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+                        writer.writeheader()
+                        writer.writerows(rows)
+        except Exception as error:
+            first_error = first_error or error
+        finally:
+            try:
+                communicator.close()
+            except Exception as error:
+                first_error = first_error or error
+    if first_error is not None:
+        raise first_error
+
 
 class GINAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     """GIN payload exchange with dynamic or benchmark-static count metadata."""
@@ -682,6 +725,8 @@ class GINAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         capacity_factor: float | None = None
         static_balanced_routing: bool = False
         steady_state_barrier_elision: bool = False
+        phase_timing: bool = False
+        phase_timing_capacity: int = 2048
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -701,6 +746,10 @@ class GINAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         self.steady_state_barrier_elision = (
             config.steady_state_barrier_elision
         )
+        self.phase_timing = config.phase_timing
+        self.phase_timing_capacity = config.phase_timing_capacity
+        if self.phase_timing_capacity <= 0:
+            raise ValueError("GIN phase_timing_capacity must be positive")
         if (
             self.steady_state_barrier_elision
             and not self.static_balanced_routing
@@ -789,6 +838,8 @@ class GINAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             self.hidden_dim,
             self.cta_count,
             self.steady_state_barrier_elision,
+            self.phase_timing,
+            self.phase_timing_capacity,
         )
         cached_communicator = _GIN_COMMUNICATORS.get(communicator_key)
         if cached_communicator is not None:
@@ -820,6 +871,10 @@ class GINAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         )
         self._gin_communicator.set_steady_state_barrier_elision(
             self.steady_state_barrier_elision
+        )
+        self._gin_communicator.configure_phase_timing(
+            self.phase_timing,
+            self.phase_timing_capacity,
         )
         _GIN_COMMUNICATORS[communicator_key] = self._gin_communicator
 
@@ -942,6 +997,7 @@ class GINAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             input_splits=input_splits,
             output_splits=output_splits,
             capacity_per_peer=self.capacity_per_peer,
+            operation=operation,
         )
 
     def _dispatch_token_exchange(

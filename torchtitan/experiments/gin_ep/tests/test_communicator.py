@@ -77,6 +77,7 @@ def main() -> None:
         assert comm.symmetric_buffers_allocated
         assert comm.symmetric_buffer_bytes == 4096
 
+        comm.configure_phase_timing(enabled=True, capacity=128)
         comm.create_device_communicator(cta_count=64)
         assert comm.device_communicator_created
         assert comm.device_cta_count == 64
@@ -231,6 +232,21 @@ def main() -> None:
             assert "input split exceeds" in str(error)
         else:
             raise AssertionError("accepted a split larger than capacity")
+
+        timing_info = dict(comm.phase_timing_info())
+        assert timing_info["enabled"]
+        assert timing_info["launch_count"] > 0
+        assert timing_info["dropped_launch_count"] == 0
+        phase_timings = [dict(row) for row in comm.phase_timings()]
+        assert len(phase_timings) == timing_info["launch_count"]
+        assert all(
+            row["overlapped_phase_max_us"] >= 0 for row in phase_timings
+        )
+        assert all(row["scale_out_total_us"] >= 0 for row in phase_timings)
+        assert all(row["scale_up_cta_max_us"] >= 0 for row in phase_timings)
+        assert {
+            row["critical_path"] for row in phase_timings
+        } <= {"scale_up", "scale_out"}
 
         dist.barrier()
         comm.close()

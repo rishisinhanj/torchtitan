@@ -9,6 +9,14 @@ from torch.utils.cpp_extension import load
 
 _HERE = Path(__file__).resolve().parent
 
+PHASE_TIMING_OPERATIONS = {
+    "unknown": 0,
+    "dispatch_forward": 1,
+    "combine_forward": 2,
+    "dispatch_backward": 3,
+    "combine_backward": 4,
+}
+
 
 @lru_cache(maxsize=1)
 def _load_extension():
@@ -109,36 +117,44 @@ class _FixedAllToAll(torch.autograd.Function):
         ctx,
         communicator: Any,
         input: torch.Tensor,
+        operation: int,
     ) -> torch.Tensor:
         ctx.communicator = communicator
-        return communicator.fixed_all_to_all(input)
+        ctx.backward_operation = operation + 2 if operation in (1, 2) else 0
+        return communicator.fixed_all_to_all(input, operation)
 
     @staticmethod
     def backward(
         ctx,
         grad_output: torch.Tensor,
-    ) -> tuple[None, torch.Tensor]:
+    ) -> tuple[None, torch.Tensor, None]:
         return (
             None,
             ctx.communicator.fixed_all_to_all(
-                grad_output.contiguous()
+                grad_output.contiguous(),
+                ctx.backward_operation,
             ),
+            None,
         )
 
 
 def fixed_all_to_all(
     communicator: Any,
     input: torch.Tensor,
+    *,
+    operation: int = 0,
 ) -> torch.Tensor:
-    return _FixedAllToAll.apply(communicator, input)
+    return _FixedAllToAll.apply(communicator, input, operation)
 
 
 def fixed_all_to_all_out(
     communicator: Any,
     input: torch.Tensor,
     output: torch.Tensor,
+    *,
+    operation: int = 0,
 ) -> torch.Tensor:
-    return communicator.fixed_all_to_all_out(input, output)
+    return communicator.fixed_all_to_all_out(input, output, operation)
 
 
 def variable_all_to_all(
@@ -148,6 +164,7 @@ def variable_all_to_all(
     input_splits: list[int],
     output_splits: list[int],
     capacity_per_peer: int,
+    operation: str = "unknown",
 ) -> torch.Tensor:
     world_size = communicator.world_size
     if len(input_splits) != world_size:
@@ -160,6 +177,7 @@ def variable_all_to_all(
         raise ValueError("output split exceeds the per-peer capacity")
     if sum(input_splits) != input.shape[0]:
         raise ValueError("input_splits do not sum to the input row count")
+    operation_code = PHASE_TIMING_OPERATIONS.get(f"{operation}_forward", 0)
 
     # Balanced routing already lays out one full, contiguous capacity slice per
     # peer. Preserve that layout across the fixed all-to-all instead of
@@ -174,7 +192,11 @@ def variable_all_to_all(
                 capacity_per_peer,
                 *input.shape[1:],
             )
-            return fixed_all_to_all(communicator, packed).view_as(input)
+            return fixed_all_to_all(
+                communicator,
+                packed,
+                operation=operation_code,
+            ).view_as(input)
 
     with torch.profiler.record_function("gin_phase::variable_pack"):
         packed = input.new_zeros(
@@ -188,7 +210,11 @@ def variable_all_to_all(
             input_offset += count
 
     with torch.profiler.record_function("gin_phase::fixed_exchange"):
-        received = fixed_all_to_all(communicator, packed)
+        received = fixed_all_to_all(
+            communicator,
+            packed,
+            operation=operation_code,
+        )
     with torch.profiler.record_function("gin_phase::variable_unpack"):
         return torch.cat(
             [

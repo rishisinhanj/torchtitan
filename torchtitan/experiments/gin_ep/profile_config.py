@@ -32,6 +32,12 @@ def _deepseek_16b_profile(comm_backend: str):
         steady_state_barrier_elision = (
             os.environ.get("GIN_PROFILE_BARRIER_ELISION", "0") == "1"
         )
+        phase_timing = (
+            os.environ.get("GIN_PROFILE_PHASE_TIMING", "0") == "1"
+        )
+        phase_timing_capacity = int(
+            os.environ.get("GIN_PROFILE_PHASE_TIMING_CAPACITY", "2048")
+        )
         for layer in config.model_spec.model.layers:
             moe = getattr(layer, "moe", None)
             if moe is None:
@@ -43,6 +49,8 @@ def _deepseek_16b_profile(comm_backend: str):
             dispatcher.steady_state_barrier_elision = (
                 steady_state_barrier_elision
             )
+            dispatcher.phase_timing = phase_timing
+            dispatcher.phase_timing_capacity = phase_timing_capacity
     config.hf_assets_path = "./tests/assets/tokenizer"
     config.dataloader = GrainDataLoader.Config(
         dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
