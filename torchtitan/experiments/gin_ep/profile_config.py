@@ -13,7 +13,13 @@ from torchtitan.models.deepseek_v3.config_registry import deepseek_v3_16b
 def _deepseek_16b_profile(comm_backend: str):
     world_size = int(os.environ.get("GIN_PROFILE_WORLD_SIZE", "16"))
     steps = int(os.environ.get("GIN_PROFILE_STEPS", "4"))
-    tokens = int(os.environ.get("GIN_PROFILE_TOKENS", "512"))
+    # Normal torchtitan knobs: sequence length and (local) batch size, set
+    # independently rather than conflated into one "tokens" value. Total
+    # per-rank token budget is their product (this fork packs sequences up
+    # to seq_len to fill that budget -- see TrainingConfig in configs.py).
+    seq_len = int(os.environ.get("GIN_PROFILE_SEQ_LEN", "512"))
+    batch_size = int(os.environ.get("GIN_PROFILE_BATCH_SIZE", "1"))
+    tokens = seq_len * batch_size
     enable_profiling = os.environ.get("GIN_PROFILE_ENABLE", "1") == "1"
     config = deepseek_v3_16b()
     config.model_spec = model_registry(
@@ -57,7 +63,7 @@ def _deepseek_16b_profile(comm_backend: str):
     )
 
     config.training.num_tokens_per_microbatch_per_dp_rank = tokens
-    config.training.max_context_length = tokens
+    config.training.max_context_length = seq_len
     config.training.steps = steps
     config.training.disable_cuda_graphs = True
     config.training.dtype = "bfloat16"
