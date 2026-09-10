@@ -33,7 +33,7 @@ def build_model_tests_list() -> list[OverrideDefinitions]:
             test_name="llama3_fsdp+tp+cp+region_ac",
             ngpu=8,
             golden_numerics_path=(
-                "tests/assets/losses/{execution_mode}/llama3_a10g.txt"
+                "tests/assets/losses/{execution_mode}/llama3_{gpu_arch}.txt"
             ),
         ),
         OverrideDefinitions(
