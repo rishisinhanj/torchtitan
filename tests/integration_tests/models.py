@@ -138,6 +138,8 @@ def build_model_tests_list() -> list[OverrideDefinitions]:
             ngpu=8,
             # NOTE: This topology is not bitwise deterministic with Real PG on
             # A10G, so this case provides end-to-end coverage without a golden.
+            # short_conv's CuTe/CUTLASS kernel (attn_gym) is CUDA-only.
+            skip_rocm_test=True,
         ),
         OverrideDefinitions(
             configs=[recipes.qwen35_debugmodel_varlen_attn_fsdp2_tp2_sac],
