@@ -280,6 +280,16 @@ class InterGeneratorRouter(Actor, Configurable):
         await self._fanout("start_engine_loop")
 
     @concurrent_endpoint
+    async def start_profiling(self) -> None:
+        """Start the torch profiler on every rank of every generator."""
+        await self._fanout("start_profiling")
+
+    @concurrent_endpoint
+    async def stop_profiling(self) -> None:
+        """Stop the torch profiler on every rank of every generator, flushing traces."""
+        await self._fanout("stop_profiling")
+
+    @concurrent_endpoint
     async def sync_log_step(self, step: int) -> None:
         """Set the step counter in this process and in every generator rank."""
         sl.set_step(step)

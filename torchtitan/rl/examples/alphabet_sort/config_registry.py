@@ -627,6 +627,21 @@ def rl_grpo_qwen3_14b() -> Controller.Config:
     )
 
 
+def rl_grpo_qwen3_14b_no_compile() -> Controller.Config:
+    """Same as rl_grpo_qwen3_14b, with compile disabled.
+
+    torch.compile is skipped for a run whose only purpose is to harvest ATO's
+    dispatch-decision log: amd_titan._ops._dispatch skips its whole diagnostic
+    layer under torch.compiler.is_compiling(), so a compiled run produces an
+    empty decisions.jsonl. There is no CLI flag for this on rl_grpo_qwen3_14b
+    (CompileConfig has no enable field to negate), so this is a real config
+    variant, not a --compile override.
+    """
+    config = rl_grpo_qwen3_14b()
+    config.compile = None
+    return config
+
+
 def rl_grpo_qwen3_moe_debug_varlen() -> Controller.Config:
     """Debug MoE config with EP+TP on generator (8 GPUs: 4 gen + 4 train).
 

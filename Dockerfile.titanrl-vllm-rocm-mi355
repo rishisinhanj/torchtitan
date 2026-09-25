@@ -1,0 +1,344 @@
+###############################################################################
+# =============================================================================
+# Dockerfile.titanrl-vllm-rocm-mi355
+#   TitanRL ROCm runtime image built from a clean public pytorch/torchtitan
+#   checkout (torchtitan/rl/, not the internal experiments/rl fork layout),
+#   targeting MI355X (gfx950 / CDNA4). Adapted from the MI300X (gfx942) recipe
+#   -- only the target-architecture flags changed; everything else (base
+#   image, torch nightly pin, vLLM/AITER pins) is carried over unverified for
+#   gfx950 and should be treated as a hypothesis until the build/import steps
+#   below actually confirm it.
+#
+#   - torch is upgraded past PyTorch PR #180428 (2026-04-23, fixes the FSDP2
+#     chunked-loss partial-group-backward crash). The base image's own torch
+#     (release/2.12, forked 2026-04-15, before that fix) predates it.
+#   - vLLM/AITER are rebuilt from source against the upgraded torch (no
+#     pre-built ROCm vLLM wheel exists to swap in instead).
+#   - flydsl is uninstalled and AITER's mha.py is patched to make its import
+#     optional (native MLIR double-registration abort otherwise).
+#   - AITER's dtypes.py is patched so its eager fp8-dtype detection falls back
+#     to the GPU_ARCHS-aware get_gfx() when no GPU is present (get_gfx_runtime()
+#     always shells out to rocminfo and has no such fallback) -- needed because
+#     `docker build` has no GPU device access.
+#   - RL dependencies are installed the same way the Nvidia/CUDA image does:
+#     `pip install -e .` for core torchtitan + its own deps, then the repo's
+#     own torchtitan/rl/requirements.txt + examples/dapo_math/requirements.txt,
+#     not a hand-maintained package list.
+#
+#   Build context = a clean public pytorch/torchtitan checkout, e.g.
+#   ~/qwen3_kernel_study (branch qwen3-kernel-study):
+#     docker build \
+#       -f Dockerfile.titanrl-vllm-rocm-mi355 \
+#       -t titanrl:mi355-rocm .
+# =============================================================================
+
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.29.0
+ARG TORCHTITAN_HOME=/app/torchtitan
+
+FROM ${BASE_IMAGE}
+
+ARG TORCHTITAN_HOME
+ARG TORCH_NIGHTLY_DATE=20260811
+ARG ROCM_WHEEL_TAG=rocm7.14
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV TORCHTITAN_HOME=${TORCHTITAN_HOME}
+ENV PYTHONPATH=${TORCHTITAN_HOME}
+ENV NCCL_DEBUG=WARN
+ENV PYTORCH_ROCM_ARCH=gfx950
+# Persisted (not just prefixed on the aiter build RUN line below) so later
+# RUN layers -- e.g. the `import aiter` verification step -- also skip
+# aiter's native GPU autodetection (rocminfo), which fails during `docker
+# build` since no GPU device is passed through to the build container.
+ENV GPU_ARCHS=gfx950
+
+WORKDIR ${TORCHTITAN_HOME}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    cmake \
+    git \
+    libibverbs1 \
+    ibverbs-providers \
+    rdma-core \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --no-cache-dir --upgrade pip wheel "setuptools>=77.0.3,<80.0.0"
+
+RUN python3 -m pip install --no-cache-dir \
+    cmake \
+    ninja \
+    packaging \
+    pybind11 \
+    scikit-build-core \
+    setuptools-rust \
+    setuptools-scm
+
+# =============================================================================
+# Swap the base image's torch (release/2.12, predates PR #180428) for a
+# matched-date ROCm nightly built from main (post #180428, matches the Nvidia
+# image's torch==2.14.0.dev20260811+cu130). Must happen before vLLM/AITER get
+# rebuilt below, since they need to compile against this torch.
+# =============================================================================
+RUN python3 -m pip install --no-cache-dir --pre \
+    "torch==2.14.0.dev${TORCH_NIGHTLY_DATE}+${ROCM_WHEEL_TAG}" \
+    "torchvision==0.29.0.dev20260812+${ROCM_WHEEL_TAG}" \
+    --extra-index-url https://download.pytorch.org/whl/nightly/${ROCM_WHEEL_TAG}
+
+RUN python3 - <<'PY'
+import torch
+print('torch', torch.__version__)
+if torch.version.hip is None:
+    raise SystemExit('expected ROCm torch, got ' + torch.__version__)
+if '20260811' not in torch.__version__:
+    raise SystemExit('nightly date pin did not take: ' + torch.__version__)
+PY
+
+COPY . ${TORCHTITAN_HOME}/
+
+# Core torchtitan + its own pyproject.toml deps (grain, datasets, tokenizers,
+# renderers, safetensors, tyro, tensorboard, wandb, einops, pillow, spmd_types,
+# attn-gym[linear], torch_remat).
+RUN python3 -m pip install --no-cache-dir -e .
+
+# attn-gym's optional linear extra upgrades this beyond vLLM's exact pin.
+# DAPO/Qwen does not use that extra, so restore the vLLM-compatible build
+# (matches the Nvidia/CUDA image's apache-tvm-ffi pin).
+RUN python3 -m pip install --no-cache-dir --no-deps \
+    "apache-tvm-ffi==0.1.11"
+
+# RL-specific deps: torchmonarch pinned explicitly, opentelemetry/pygtrie/
+# portpicker come from the repo's own torchtitan/rl/requirements.txt.
+RUN python3 -m pip install --no-cache-dir \
+    "torchmonarch==0.6.0" \
+    -r torchtitan/rl/requirements.txt
+
+# Install without dependency resolution so pip cannot replace the (now-
+# upgraded) ROCm torch with an incompatible wheel. Pinned to the same commit
+# as the Nvidia image for cross-platform parity.
+RUN python3 -m pip install --no-cache-dir --no-deps \
+    torch-c-dlpack-ext==0.1.5 \
+    "git+https://github.com/meta-pytorch/torchstore.git@a80f8cae60ed9336b547fded9108f4df8222f0e8"
+
+RUN python3 -m pip install --no-cache-dir \
+    -r torchtitan/rl/examples/dapo_math/requirements.txt
+
+# =============================================================================
+# The base image's pre-built vLLM/AITER were compiled against the OLD torch.
+# Rebuild both from source against the upgraded torch, --no-build-isolation so
+# they link against it instead of pip resolving a fresh one.
+# =============================================================================
+RUN python3 -m pip uninstall -y vllm aiter amd-aiter || true
+
+RUN git clone --branch v0.28.0 --depth 1 https://github.com/vllm-project/vllm.git /tmp/vllm \
+    && cd /tmp/vllm \
+    && PYTORCH_ROCM_ARCH=gfx950 VLLM_TARGET_DEVICE=rocm MAX_JOBS=16 \
+       python3 -m pip install --no-cache-dir --no-build-isolation --no-deps . \
+    && rm -rf /tmp/vllm
+
+# Pinned (not `main` HEAD) to a known-good commit: main has had a burst of
+# recent changes (topk_select.py's Sep-14 five-backend rewrite, commit
+# d81eb4857e) that make `import aiter` hard-require flydsl in more places than
+# just mha.py -- flydsl is deliberately uninstalled below to avoid its native
+# MLIR double-registration crash. This pin is the immediate parent of that
+# rewrite (2026-09-13), verified to still need (and cleanly accept) the
+# dtypes.py/arch_info.py/mha.py patches below, just without the topk_select
+# problem. Bump deliberately, not silently, if a newer AITER feature is needed.
+# NOT YET VERIFIED for gfx950: this pin was chosen for an MI300X (gfx942)
+# reason and nobody has confirmed it ships gfx950-tuned kernels rather than
+# just gfx942 ones -- watch the build/import steps below for the real answer.
+RUN git init /tmp/aiter \
+    && cd /tmp/aiter \
+    && git remote add origin https://github.com/ROCm/aiter.git \
+    && git fetch --depth 1 origin c213dea9163254a8e1085c73e40771712fb583db \
+    && git checkout FETCH_HEAD \
+    && git submodule update --init --recursive --depth 1 \
+    && GPU_ARCHS=gfx950 python3 -m pip install --no-cache-dir --no-build-isolation --no-deps . \
+    && rm -rf /tmp/aiter
+
+# AITER's dtypes.py eagerly calls get_gfx_runtime() at import time (module-level
+# `fp8 = get_dtype_fp8()`), which always shells out to rocminfo with no GPU_ARCHS
+# fallback (unlike get_gfx(), AITER's own documented build-time codegen path --
+# see get_build_targets()'s docstring). `docker build` has no GPU device access,
+# so any `import aiter` here would otherwise fail. Fall back to get_gfx() only
+# when live detection fails; real hardware at container runtime still uses
+# get_gfx_runtime() first, unchanged.
+RUN python3 - <<'PY'
+import importlib.util
+import pathlib
+
+spec = importlib.util.find_spec("aiter")
+if spec is None or spec.origin is None:
+    raise SystemExit("AITER must be installed before patching dtypes.py")
+
+dtypes_path = pathlib.Path(spec.origin).parent / "utility" / "dtypes.py"
+if not dtypes_path.exists():
+    raise SystemExit(f"missing expected AITER file: {dtypes_path}")
+
+text = dtypes_path.read_text()
+old_import = "from ..jit.utils.chip_info import get_gfx_runtime\n"
+new_import = "from ..jit.utils.chip_info import get_gfx, get_gfx_runtime\n"
+old_fn = (
+    "def get_dtype_fp8():\n"
+    '    return defaultDtypes.get(get_gfx_runtime(), {"fp8": _8bit_fallback})["fp8"]\n'
+)
+new_fn = (
+    "def get_dtype_fp8():\n"
+    "    # get_gfx_runtime() always shells out to rocminfo and has no GPU-less\n"
+    "    # fallback; fall back to the GPU_ARCHS-aware get_gfx() (AITER's own\n"
+    "    # documented build-time codegen path) when no GPU is present, e.g.\n"
+    "    # during `docker build`.\n"
+    "    try:\n"
+    "        gfx = get_gfx_runtime()\n"
+    "    except Exception:\n"
+    "        gfx = get_gfx()\n"
+    '    return defaultDtypes.get(gfx, {"fp8": _8bit_fallback})["fp8"]\n'
+)
+if old_import in text and old_fn in text:
+    text = text.replace(old_import, new_import, 1).replace(old_fn, new_fn, 1)
+    dtypes_path.write_text(text)
+    print(f"patched GPU-less fallback for get_dtype_fp8 in {dtypes_path}")
+elif "except Exception:\n        gfx = get_gfx()" in text:
+    print(f"GPU-less fallback already present in {dtypes_path}")
+else:
+    raise SystemExit(f"could not find get_dtype_fp8/import to patch in {dtypes_path}")
+PY
+
+# aiter/ops/attention.py imports aiter.ops.triton.gluon.pa_decode_gluon at
+# module level, which imports arch_info.py, which falls back to `jax` (not
+# installed, and not otherwise needed) when triton's own GPU-driver arch query
+# fails with no GPU present. Add a GPU_ARCHS-based fallback for that case too,
+# same pattern as the dtypes.py patch above; real hardware still hits the
+# triton driver path first, unchanged.
+RUN python3 - <<'PY'
+import importlib.util
+import pathlib
+
+spec = importlib.util.find_spec("aiter")
+if spec is None or spec.origin is None:
+    raise SystemExit("AITER must be installed before patching arch_info.py")
+
+arch_info_path = (
+    pathlib.Path(spec.origin).parent
+    / "ops" / "triton" / "utils" / "_triton" / "arch_info.py"
+)
+if not arch_info_path.exists():
+    raise SystemExit(f"missing expected AITER file: {arch_info_path}")
+
+text = arch_info_path.read_text()
+old = (
+    "try:\n"
+    "    _CACHED_ARCH = triton.runtime.driver.active.get_current_target().arch\n"
+    "except RuntimeError:\n"
+    "    from jax._src.lib import gpu_triton as triton_kernel_call_lib\n\n"
+    '    _CACHED_ARCH = triton_kernel_call_lib.get_arch_details("0").split(":")[0]\n'
+)
+new = (
+    "try:\n"
+    "    _CACHED_ARCH = triton.runtime.driver.active.get_current_target().arch\n"
+    "except RuntimeError:\n"
+    "    try:\n"
+    "        from jax._src.lib import gpu_triton as triton_kernel_call_lib\n\n"
+    "        _CACHED_ARCH = triton_kernel_call_lib.get_arch_details(\"0\").split(\":\")[0]\n"
+    "    except ModuleNotFoundError:\n"
+    "        # No live GPU and no jax (e.g. a `docker build` stage) -- fall back to\n"
+    "        # the GPU_ARCHS env var used elsewhere for build-time-only detection.\n"
+    "        import os\n\n"
+    '        _CACHED_ARCH = os.environ.get("GPU_ARCHS", "gfx950")\n'
+)
+if old in text:
+    arch_info_path.write_text(text.replace(old, new, 1))
+    print(f"patched GPU-less fallback for _CACHED_ARCH in {arch_info_path}")
+elif "GPU_ARCHS env var used elsewhere" in text:
+    print(f"GPU-less fallback already present in {arch_info_path}")
+else:
+    raise SystemExit(f"could not find _CACHED_ARCH block to patch in {arch_info_path}")
+PY
+
+# The ROCm generator routes vLLM attention through AITER. Keep flydsl out of
+# the environment because it caused native MLIR double-registration aborts,
+# and patch AITER so its flydsl FMHA path is optional. AITER itself is
+# required: this image should fail to build if the freshly-built AITER
+# doesn't provide it.
+RUN python3 -m pip uninstall -y flydsl || true
+
+RUN python3 - <<'PY'
+import importlib.util
+import importlib
+import importlib.metadata
+import pathlib
+
+spec = importlib.util.find_spec("aiter")
+if spec is None or spec.origin is None:
+    raise SystemExit("AITER must be installed after rebuild")
+
+mha = pathlib.Path(spec.origin).parent / "ops" / "mha.py"
+if not mha.exists():
+    raise SystemExit(f"missing expected AITER file: {mha}")
+
+text = mha.read_text()
+old = "        from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func\n"
+new = """        # Treat FlyDSL as optional; returning None falls through to the next AITER path.
+        try:
+            from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
+        except ModuleNotFoundError:
+            flydsl_flash_attn_varlen_func = lambda *args, **kwargs: None
+"""
+if old in text:
+    mha.write_text(text.replace(old, new, 1))
+    print(f"patched optional flydsl import in {mha}")
+elif "flydsl_flash_attn_varlen_func = lambda *args, **kwargs: None" in text:
+    print(f"AITER flydsl optional-import patch already present in {mha}")
+else:
+    raise SystemExit(f"could not find FlyDSL import to patch in {mha}")
+
+if importlib.util.find_spec("flydsl") is not None:
+    raise SystemExit("flydsl must not be importable after uninstall")
+
+import aiter
+mha_module = importlib.import_module("aiter.ops.mha")
+
+for package_name in ("amd-aiter", "amd_aiter", "aiter"):
+    try:
+        version = importlib.metadata.version(package_name)
+        break
+    except importlib.metadata.PackageNotFoundError:
+        version = "unknown"
+
+print("AITER import OK:", version, "from", pathlib.Path(aiter.__file__).parent)
+print("AITER mha import OK:", mha_module.__file__)
+PY
+
+RUN python3 - <<'PY'
+import importlib.util
+import importlib.metadata
+import inspect
+import torch
+import monarch.actor
+import torchstore
+
+for name in ["aiter", "monarch", "torchstore", "vllm"]:
+    if importlib.util.find_spec(name) is None:
+        raise SystemExit(f"missing required package: {name}")
+
+if importlib.util.find_spec("flydsl") is not None:
+    raise SystemExit("flydsl must not be importable")
+
+if torch.version.hip is None:
+    raise SystemExit(f"expected ROCm torch, got {torch.__version__}")
+
+import torch.distributed.fsdp._fully_shard._fsdp_param_group as fsdp_param_group
+if "is_partial_group_backward" not in inspect.getsource(fsdp_param_group):
+    raise SystemExit(
+        f"PR #180428 fix not present in torch {torch.__version__} -- "
+        "check the nightly date pin"
+    )
+
+print("torch", torch.__version__)
+print("vllm", importlib.metadata.version("vllm"))
+print("PR #180428 fix confirmed present")
+PY
+
+ENTRYPOINT []
+CMD ["sleep", "infinity"]
