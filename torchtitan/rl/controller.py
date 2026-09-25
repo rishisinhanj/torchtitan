@@ -312,26 +312,10 @@ class Controller(Configurable):
             default_factory=m.MetricsProcessor.Config
         )
 
-        profile_at_step: int | None = None
-        """Training step (1-indexed) at which to bracket every generator with
-        `start_profiling` / `stop_profiling` calls. `None` (default) disables
-        this. Requires `generator.enable_profiling=True` for the generators to
-        actually have a profiler wired into their vLLM engine; this field only
-        controls when the bracket fires. The trainer's own Kineto capture is
-        controlled separately, on its own schedule, by `trainer.profiler`."""
-
         def __post_init__(self):
             if self.num_generators < 1:
                 raise ValueError(
                     f"num_generators must be at least 1, got {self.num_generators}"
-                )
-            if self.profile_at_step is not None and not (
-                0 < self.profile_at_step <= self.async_loop.num_training_steps
-            ):
-                raise ValueError(
-                    "profile_at_step must be in (0, async_loop.num_training_steps] "
-                    f"({self.async_loop.num_training_steps}), got "
-                    f"{self.profile_at_step}"
                 )
             if self.generator.checkpointer is not None:
                 raise ValueError(
@@ -1061,91 +1045,77 @@ class Controller(Configurable):
                 await self._rollouter.sync_log_step(step)
             step_timer = MetricsTimer()
 
-            # Bracket exactly one training step's generators with start/stop
-            # profiling calls, symmetric with the trainer's own per-step
-            # `step_profiler()` (driven separately by `trainer.profiler`'s own
-            # schedule). `try`/`finally` so a `break` inside the step (e.g.
-            # shutdown, NaN loss) can't leave generator profiling stuck on.
-            profile_generators_this_step = step == self.config.profile_at_step
-            if profile_generators_this_step:
-                with sl.log_trace_span("generator_start_profiling"):
-                    await self.generator_router.start_profiling.call_one()
-            try:
-                with sl.log_trace_span("train_step"), step_timer.record(
-                    "timing/step/total"
+            with sl.log_trace_span("train_step"), step_timer.record(
+                "timing/step/total"
+            ):
+                # Waits for a TrainerStepBatch to be ready (or None on shutdown).
+                with sl.log_trace_span("wait_for_training_batch"), step_timer.record(
+                    "timing/step/wait_for_training_batch"
                 ):
-                    # Waits for a TrainerStepBatch to be ready (or None on shutdown).
-                    with sl.log_trace_span(
-                        "wait_for_training_batch"
-                    ), step_timer.record("timing/step/wait_for_training_batch"):
-                        packed = await training_batch_queue.get()
+                    packed = await training_batch_queue.get()
 
-                    if packed is None:
-                        logger.info("Batcher closed and drained; stopping training")
+                if packed is None:
+                    logger.info("Batcher closed and drained; stopping training")
+                    break
+
+                # Policy age is computed HERE, at consumption time, against the live trainer version, so it is
+                # faithful to what this step trains on -- not the version when the batch was packed.
+                policy_age_panel = compute_policy_age_metrics(
+                    trainer_policy_version=self._trainer_policy_version,
+                    min_policy_versions=packed.min_policy_versions,
+                    target_offpolicy_steps=(
+                        self.config.async_loop.target_offpolicy_steps
+                    ),
+                    max_offpolicy_steps=self.config.async_loop.max_offpolicy_steps,
+                )
+
+                # TODO(async): can't stream microbatches (interleave pack->train) — the loss is normalized by
+                #   packed.num_global_valid_tokens (sum over ALL microbatches), needed before any fwd/bwd. To
+                #   support streaming, accumulate raw loss/token counts across microbatches and scale before optimizer.
+                with sl.log_trace_span("forward_backward_steps"), step_timer.record(
+                    "timing/step/forward_backward"
+                ):
+                    fwd_bwd_metrics = self._get_rank_0_value(
+                        await self.trainer.forward_backward_steps.call(
+                            packed.microbatches,
+                            packed.num_global_valid_tokens,
+                        )
+                    )
+
+                    if not math.isfinite(fwd_bwd_metrics["loss/mean"]):
+                        logger.error("Loss is NaN/Inf; training diverged")
                         break
 
-                    # Policy age is computed HERE, at consumption time, against the live trainer version, so it is
-                    # faithful to what this step trains on -- not the version when the batch was packed.
-                    policy_age_panel = compute_policy_age_metrics(
-                        trainer_policy_version=self._trainer_policy_version,
-                        min_policy_versions=packed.min_policy_versions,
-                        target_offpolicy_steps=(
-                            self.config.async_loop.target_offpolicy_steps
-                        ),
-                        max_offpolicy_steps=self.config.async_loop.max_offpolicy_steps,
-                    )
+                # Await trainer weight push before the optimizer mutates the weights.
+                with sl.log_trace_span(
+                    "blocking_trainer_push_model_state_dict"
+                ), step_timer.record(
+                    "timing/step/blocking_trainer_push_model_state_dict"
+                ):
+                    push_metrics = await self._weight_sync.wait_prev_push()
 
-                    # TODO(async): can't stream microbatches (interleave pack->train) — the loss is normalized by
-                    #   packed.num_global_valid_tokens (sum over ALL microbatches), needed before any fwd/bwd. To
-                    #   support streaming, accumulate raw loss/token counts across microbatches and scale before optimizer.
-                    with sl.log_trace_span("forward_backward_steps"), step_timer.record(
-                        "timing/step/forward_backward"
-                    ):
-                        fwd_bwd_metrics = self._get_rank_0_value(
-                            await self.trainer.forward_backward_steps.call(
-                                packed.microbatches,
-                                packed.num_global_valid_tokens,
-                            )
+                with sl.log_trace_span("optimizer_step"), step_timer.record(
+                    "timing/step/optimizer"
+                ):
+                    optimizer_result = self._get_rank_0_value(
+                        await self.trainer.optimizer_step.call(
+                            last_step=(step == num_training_steps)
                         )
-
-                        if not math.isfinite(fwd_bwd_metrics["loss/mean"]):
-                            logger.error("Loss is NaN/Inf; training diverged")
-                            break
-
-                    # Await trainer weight push before the optimizer mutates the weights.
-                    with sl.log_trace_span(
-                        "blocking_trainer_push_model_state_dict"
-                    ), step_timer.record(
-                        "timing/step/blocking_trainer_push_model_state_dict"
-                    ):
-                        push_metrics = await self._weight_sync.wait_prev_push()
-
-                    with sl.log_trace_span("optimizer_step"), step_timer.record(
-                        "timing/step/optimizer"
-                    ):
-                        optimizer_result = self._get_rank_0_value(
-                            await self.trainer.optimizer_step.call(
-                                last_step=(step == num_training_steps)
-                            )
-                        )
-                    self._trainer_policy_version = optimizer_result.policy_version
-
-                    # Await generator weight pull to finish before the trainer's next push.
-                    with sl.log_trace_span(
-                        "blocking_generator_pull_model_state_dict"
-                    ), step_timer.record(
-                        "timing/step/blocking_generator_pull_model_state_dict"
-                    ):
-                        pull_metrics = await self._weight_sync.wait_prev_pull()
-
-                    # Overlap this step's push -> pull -> buffer-slot release with the next step's fwd/bwd.
-                    self._weight_sync.start_async_push_pull(
-                        version=optimizer_result.policy_version
                     )
-            finally:
-                if profile_generators_this_step:
-                    with sl.log_trace_span("generator_stop_profiling"):
-                        await self.generator_router.stop_profiling.call_one()
+                self._trainer_policy_version = optimizer_result.policy_version
+
+                # Await generator weight pull to finish before the trainer's next push.
+                with sl.log_trace_span(
+                    "blocking_generator_pull_model_state_dict"
+                ), step_timer.record(
+                    "timing/step/blocking_generator_pull_model_state_dict"
+                ):
+                    pull_metrics = await self._weight_sync.wait_prev_pull()
+
+                # Overlap this step's push -> pull -> buffer-slot release with the next step's fwd/bwd.
+                self._weight_sync.start_async_push_pull(
+                    version=optimizer_result.policy_version
+                )
 
             # TODO(metrics): See if metrics are being computed at the right place. E.g. should we put all
             # rollout related metrics here, or move all of them to the rollouter.

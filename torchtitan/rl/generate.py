@@ -28,14 +28,12 @@ from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-from vllm.platforms import current_platform
 
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.config import OverrideConfig
 from torchtitan.distributed.utils import set_batch_invariance
 from torchtitan.models.common.attention import FlexInnerAttention, VarlenInnerAttention
+from torchtitan.rl.attention_backend import vllm_attention_backend
 from torchtitan.rl.examples.alphabet_sort import config_registry
 from torchtitan.rl.model.vllm_registry import (
     register_to_vllm,
@@ -46,21 +44,6 @@ from torchtitan.tools.utils import has_cuda_capability
 
 
 logger = init_logger(__name__)
-
-
-def _vllm_attention_backend(attention_backend) -> AttentionBackendEnum:
-    """Pick the vLLM backend serving the model spec's full-attention layers.
-
-    CUSTOM is torchtitan's torch varlen backend, which asserts on
-    ``vllm_flash_attn_version``; vLLM returns None for it on ROCm (it does not
-    ship vllm_flash_attn there), so that backend cannot serve a ROCm generator.
-    ROCm routes to vLLM's AITER FlashAttention backend instead. See PR #4866.
-    """
-    if isinstance(attention_backend, FlexInnerAttention.Config):
-        return AttentionBackendEnum.FLEX_ATTENTION
-    if current_platform.is_rocm():
-        return AttentionBackendEnum.ROCM_AITER_FA
-    return AttentionBackendEnum.CUSTOM
 
 
 def _parse_args() -> argparse.Namespace:
@@ -96,12 +79,6 @@ def _parse_args() -> argparse.Namespace:
         "to the generator's model spec (e.g. "
         "'amd_titan.ops.norm.rmsnorm,amd_titan.ops.attention.qk_norm_rope'). "
         "Omit for the stock (no-override) leg.",
-    )
-    parser.add_argument(
-        "--warmup",
-        action="store_true",
-        help="Run one untimed/unprofiled generation first, to warm up JIT/"
-        "kernel caches before --profile captures a trace.",
     )
     parser.add_argument(
         "--profile",
@@ -193,7 +170,7 @@ def generate() -> None:
         gpu_memory_utilization=gen_config.gpu_memory_limit,
         enforce_eager=gen_config.cuda_graph.mode == "NONE",
         attention_config=AttentionConfig(
-            backend=_vllm_attention_backend(attention_backend),
+            backend=vllm_attention_backend(attention_backend),
         ),
         disable_log_stats=False,
     )
@@ -283,17 +260,10 @@ def generate() -> None:
     def _profile_one_pass(request_id: str) -> None:
         """Capture a torch profiler chrome trace of one generation pass.
 
-        Same pattern as the already-verified `upstream/inference-ablation`
-        harness's `_profile_one_pass`: a plain `torch.profiler.profile()`
-        context manager, in-process, on this script's own main thread under
-        `torchrun` -- no Monarch actor, no RPC, no thread hand-off. That's
-        deliberate: driving vLLM's profiler start/stop through a Monarch actor
-        endpoint hit two distinct real failures on this stack (SIGSEGV when
-        backgrounded via asyncio.to_thread -- Kineto's CUDA/HIP activity
-        backend is thread-bound and a fresh executor thread never has the
-        device context; a hang when called directly on the actor's own event
-        loop thread -- a rocprofiler-sdk inline-queue-interposition defect).
-        This script sidesteps both by never crossing an actor/RPC boundary.
+        Runs in-process on this script's own main thread under `torchrun` --
+        no Monarch actor, no RPC boundary to cross (see generator.py's
+        VLLMGenerator, where driving vLLM's profiler through an actor endpoint
+        crashes/hangs on this stack).
         """
         from torch.profiler import profile, ProfilerActivity
 
@@ -312,14 +282,10 @@ def generate() -> None:
             print(f"  profiler trace written: {out}", flush=True)
 
     logger.debug("Generating text...")
-    next_request_id = 0
-    if args.warmup:
-        _run_pass(str(next_request_id))
-        next_request_id += 1
     if args.profile:
-        _profile_one_pass(str(next_request_id))
+        _profile_one_pass("0")
     else:
-        _run_pass(str(next_request_id))
+        _run_pass("0")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 Produces two sets of Perfetto-loadable chrome-trace JSON files (one stock, one
 ATO) from vLLM's generator, with nothing else in the loop -- no trainer, no
-Monarch actors. Verified working end-to-end 2026-09-25.
+Monarch actors.
 
 ## Prerequisites
 
@@ -23,7 +23,7 @@ Monarch actors. Verified working end-to-end 2026-09-25.
 - `~/AMD-TorchTitan-Ops` present (rsync'd, not `git clone` -- this cluster's
   account hits an Enterprise IP allowlist, so `gh`/`git clone` don't work here).
 - Checkpoint present at
-  `~/qwen3_kernel_study/torchtitan/torchtitan/rl/example_checkpoint/Qwen3-14B`
+  `~/qwen3_kernel_study/torchtitan/rl/example_checkpoint/Qwen3-14B`
   (18 files). If missing:
   ```bash
   python3 scripts/download_hf_assets.py --repo_id Qwen/Qwen3-14B \
@@ -43,14 +43,14 @@ Takes ~15-20 min (vLLM + AITER built from source). Only rebuild when a
 
 ## 2. What's already patched into `generate.py` (nothing to do, just know it's there)
 
-`~/qwen3_kernel_study/torchtitan/torchtitan/rl/generate.py` has, on top of
-upstream:
-- `_vllm_attention_backend()` -- routes ROCm to `ROCM_AITER_FA` instead of
-  `CUSTOM` (ports pytorch/torchtitan#4866; `CUSTOM` asserts on a CUDA-only
-  field and would otherwise crash at engine construction).
+`~/qwen3_kernel_study/torchtitan/rl/generate.py` has, on top of upstream:
+- `vllm_attention_backend()` (shared helper in `torchtitan/rl/attention_backend.py`,
+  imported by both `generate.py` and `generator.py`) -- routes ROCm to
+  `ROCM_AITER_FA` instead of `CUSTOM` (ports pytorch/torchtitan#4866; `CUSTOM`
+  asserts on a CUDA-only field and would otherwise crash at engine construction).
 - `os.path.abspath(config.hf_assets_path)` -- `CheckpointManager.Config`
   rejects a relative path.
-- CLI flags: `--override-imports`, `--warmup`, `--profile`, `--profile-dir`
+- CLI flags: `--override-imports`, `--profile`, `--profile-dir`
   (default `/tmp/generate_traces`), `--profile-tag`.
 - `_profile_one_pass()` -- a plain `torch.profiler.profile(activities=[CPU,
   CUDA])` context manager around one generation pass, `export_chrome_trace()`

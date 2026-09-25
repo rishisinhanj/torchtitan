@@ -70,14 +70,6 @@ class _GeneratorActorEndpoints:
         await super().pull_model_state_dict(version)
 
     @concurrent_endpoint
-    async def start_profiling(self) -> None:
-        await super().start_profiling()
-
-    @concurrent_endpoint
-    async def stop_profiling(self) -> None:
-        await super().stop_profiling()
-
-    @concurrent_endpoint
     async def close(self) -> None:
         await super().close()
 

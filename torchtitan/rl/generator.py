@@ -22,11 +22,10 @@ import torch.distributed as dist
 import torchstore as ts
 import tyro
 from vllm import EngineArgs, LLMEngine, SamplingParams
-from vllm.config import AttentionConfig, CompilationConfig, ProfilerConfig
+from vllm.config import AttentionConfig, CompilationConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode, PassConfig
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
-from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from torchtitan.components.checkpointer import CheckpointManager
@@ -40,7 +39,7 @@ from torchtitan.models.common.attention import FlexInnerAttention, VarlenInnerAt
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.logging import init_logger
-from torchtitan.observability.profiler import PROFILE_DIR
+from torchtitan.rl.attention_backend import vllm_attention_backend
 from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.distributed.routing.intra_generator import IntraGeneratorRouter
 from torchtitan.rl.model.batch_invariance import force_logprobs_fn_for_batch_invariance
@@ -55,21 +54,6 @@ from torchtitan.rl.types import Completion
 from torchtitan.tools.utils import has_cuda_capability
 
 logger = logging.getLogger(__name__)
-
-
-def _vllm_attention_backend(attention_backend) -> AttentionBackendEnum:
-    """Pick the vLLM backend serving the model spec's full-attention layers.
-
-    CUSTOM is this file's torch varlen backend, which asserts on
-    ``vllm_flash_attn_version``; vLLM returns None for it on ROCm (it does not
-    ship vllm_flash_attn there), so that backend cannot serve a ROCm generator.
-    ROCm routes to vLLM's AITER FlashAttention backend instead. See PR #4866.
-    """
-    if isinstance(attention_backend, FlexInnerAttention.Config):
-        return AttentionBackendEnum.FLEX_ATTENTION
-    if current_platform.is_rocm():
-        return AttentionBackendEnum.ROCM_AITER_FA
-    return AttentionBackendEnum.CUSTOM
 
 # TODO(async-rl): this file is large. Split a backend-agnostic BaseGenerator.
 
@@ -785,36 +769,6 @@ class VLLMGenerator(Configurable):
         ] = None
         """Optional logger instantiated on TP rank 0 to export vLLM metrics."""
 
-        enable_profiling: bool = False
-        """Whether to enable vLLM's torch profiler for this generator's engine.
-
-        vLLM only honors profiler startup through a `ProfilerConfig` wired into
-        `EngineArgs` at engine-construction time (not the `VLLM_TORCH_PROFILER_DIR`
-        env var), so this flag controls that construction-time wiring. Traces are
-        written under `<output_dir>/profiling/traces/<generator_name>/`.
-
-        Capture is self-triggered by the engine from `profile_delay_iterations`/
-        `profile_max_iterations` below, not by the `start_profiling`/
-        `stop_profiling` endpoints -- those call `LLMEngine.start_profile()`/
-        `stop_profile()` over a Monarch actor endpoint, which hit two distinct
-        native failures on this stack (a SIGSEGV when backgrounded via
-        asyncio.to_thread -- Kineto's CUDA/HIP activity backend is thread-bound
-        and a fresh executor thread never has the device context; a hang when
-        called directly on the actor's own event-loop thread -- a
-        rocprofiler-sdk inline-queue-interposition defect). Self-triggering
-        avoids crossing that actor/RPC boundary entirely: the engine starts and
-        stops its own capture from inside its own loop, purely from this config.
-        """
-
-        profile_delay_iterations: int = 5
-        """Engine iterations to skip before starting capture (lets the engine
-        warm up past first-call JIT/cache-fill overhead). Only takes effect
-        when `enable_profiling=True`."""
-
-        profile_max_iterations: int = 10
-        """Engine iterations to capture, starting after `profile_delay_iterations`.
-        Only takes effect when `enable_profiling=True`."""
-
         def __post_init__(self):
             # The generator runs vLLM full expert parallelism: vLLM forms the EP
             # group from all DP*TP ranks, so expert_parallel_degree must equal
@@ -945,7 +899,7 @@ class VLLMGenerator(Configurable):
             gpu_memory_utilization=config.gpu_memory_limit,
             enforce_eager=config.cuda_graph.mode == "NONE",
             attention_config=AttentionConfig(
-                backend=_vllm_attention_backend(attention_backend),
+                backend=vllm_attention_backend(attention_backend),
             ),
             # Enables RequestOutput.metrics, so generator metrics can be returned
             disable_log_stats=False,
@@ -972,27 +926,6 @@ class VLLMGenerator(Configurable):
             engine_kwargs["compilation_config"] = vllm_compilation_config
         if config.debug.seed is not None:
             engine_kwargs["seed"] = config.debug.seed
-        if config.enable_profiling:
-            # Keyed by generator_name, not rank: recipes like dapo_math spawn N
-            # independent single-rank generator meshes, so current_rank().rank
-            # is 0 inside every one of them -- keying by rank would collide all
-            # N generators onto the same trace directory.
-            profiler_trace_dir = os.path.join(output_dir, PROFILE_DIR, generator_name)
-            os.makedirs(profiler_trace_dir, exist_ok=True)
-            engine_kwargs["profiler_config"] = ProfilerConfig(
-                profiler="torch",
-                torch_profiler_dir=profiler_trace_dir,
-                delay_iterations=config.profile_delay_iterations,
-                max_iterations=config.profile_max_iterations,
-                # vLLM's own default is True; that setting truncated generator
-                # traces to hundreds of MB of host-side python_function events
-                # with zero GPU events in a prior AMD/NVIDIA comparison study
-                # (the writer never finished flushing before teardown, and
-                # Kineto writes host events before the GPU stream, so
-                # truncation discarded exactly the kernel data traces exist
-                # for). Off here for the same reason.
-                torch_profiler_with_stack=False,
-            )
         engine_args = EngineArgs(**engine_kwargs)
 
         with sl.log_trace_span("vllm_init"):
@@ -1028,20 +961,6 @@ class VLLMGenerator(Configurable):
                 engine_args, stat_loggers=stat_loggers
             )
             logger.info("vLLM rollout engine initialized")
-            if config.enable_profiling:
-                # Start capture inline, synchronously, in the same call stack
-                # as engine construction -- deliberately NOT via a later
-                # Monarch actor RPC endpoint (that crossing is what caused a
-                # SIGSEGV when backgrounded via asyncio.to_thread, and a hang
-                # when called directly on the actor's already-running event
-                # loop thread; see start_profiling's docstring). This call
-                # only constructs vLLM's WorkerProfiler wrapper and flips it
-                # active -- delay_iterations/max_iterations (set on
-                # profiler_config above) then handle the actual start/stop
-                # timing from inside the engine's own iteration loop, so no
-                # further external trigger is needed for either edge.
-                self._engine.start_profile()
-                logger.info("vLLM profiler activated inline at engine construction")
 
         # The default PG was initialized during engine build. Confirm the configured
         # rank matches the torch-distributed global rank so the two views cannot
@@ -1461,39 +1380,6 @@ class VLLMGenerator(Configurable):
         )
 
         model_sd.update(dtensor_to_plain_tensor_state_dict(dtensor_model_sd))
-
-    async def start_profiling(self) -> None:
-        """ALL RANKS: start vLLM's torch profiler capture on this rank's local engine.
-
-        Requires `Config.enable_profiling=True` (wires vLLM's `ProfilerConfig` into
-        the engine at construction time in `__init__`; this call only toggles
-        capture on/off). Called directly on this actor's own event-loop thread,
-        not backgrounded via asyncio.to_thread: the CUDA/HIP device context is
-        thread-local, bound to the thread that constructed this engine, and
-        touching profiler/CUDA-event state from a *different* thread with no
-        device context bound is a real crash vector (segfault, not a Python
-        exception, observed empirically on gfx950). `start_profile`/`stop_profile`
-        just toggle a flag on `engine_core` -- not a long blocking call -- so
-        the original concern (blocking the event loop long enough to starve
-        Monarch's liveness pings) does not apply here the way it did for the
-        vLLM API this replaced.
-        """
-        if not self.config.enable_profiling:
-            raise ValueError(
-                "start_profiling requires VLLMGenerator.Config.enable_profiling=True"
-            )
-        self._engine.start_profile()
-
-    async def stop_profiling(self) -> None:
-        """ALL RANKS: stop vLLM's torch profiler capture and flush the Kineto trace.
-
-        See `start_profiling` for why this runs directly, not via to_thread.
-        """
-        if not self.config.enable_profiling:
-            raise ValueError(
-                "stop_profiling requires VLLMGenerator.Config.enable_profiling=True"
-            )
-        self._engine.stop_profile()
 
     async def close(self) -> None:
         """Stop the engine loop, then release the vLLM engine.
