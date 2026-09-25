@@ -70,7 +70,7 @@ docker run --rm \
   -w /app/torchtitan \
   titanrl:mi355-rocm \
   torchrun --nproc_per_node=8 -m torchtitan.rl.generate \
-    --module alphabet_sort --config rl_grpo_qwen3_14b \
+    --config rl_grpo_qwen3_14b \
     --profile --profile-dir outputs/traces/stock --profile-tag stock
 ```
 
@@ -88,7 +88,7 @@ docker run --rm \
   -w /app/torchtitan \
   titanrl:mi355-rocm \
   torchrun --nproc_per_node=8 -m torchtitan.rl.generate \
-    --module alphabet_sort --config rl_grpo_qwen3_14b \
+    --config rl_grpo_qwen3_14b \
     --override-imports amd_titan.ops.attention.qk_norm_rope \
     --profile --profile-dir outputs/traces/ato --profile-tag ato
 ```
