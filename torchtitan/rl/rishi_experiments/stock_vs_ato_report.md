@@ -104,3 +104,146 @@ regression attributable to ATO -- but it does mean **do not quote the 16.9% numb
   -- ATO trainer, compile-off
 - `traces/stock/stock_rank{0-7}.json`, `traces/ato/ato_rank{0-7}.json` -- generator,
   stock/ATO (compile never applies to the generator)
+
+## Repro steps
+
+All four runs below assume: `titanrl:mi355-rocm` already built (`docker build -t
+titanrl:mi355-rocm -f Dockerfile.titanrl-vllm-rocm-mi355 .` from `~/qwen3_kernel_study`
+-- rebuild if you're on a different node, docker images are node-local), 8 clean GPUs
+(`rocm-smi --showmeminfo vram` back to baseline on all 8, `docker ps -a` clear of
+other tenants' active workloads), and enough free space on `/home` for a checkpoint
+or two if you drop the `--trainer.checkpointer.interval` override (check `df -h
+/home` first -- this NFS mount is shared cluster-wide and has genuinely run out of
+space during this investigation).
+
+### 1. Stock, 50 steps, WandB, no profiling
+
+```bash
+docker run --rm \
+  --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size 128g \
+  --security-opt seccomp=unconfined --cap-add=SYS_PTRACE --network=host \
+  -v ~/qwen3_kernel_study/torchtitan:/app/torchtitan/torchtitan \
+  -v ~/qwen3_kernel_study/outputs:/app/torchtitan/outputs \
+  -e WANDB_API_KEY=<your key> \
+  -w /app/torchtitan \
+  titanrl:mi355-rocm \
+  python3 -m torchtitan.rl.train --module alphabet_sort --config rl_grpo_qwen3_14b_no_compile \
+  --trainer.parallelism.tensor-parallel-degree 4 \
+  --generator.parallelism.tensor-parallel-degree 4 \
+  --async-loop.num-training-steps 50 \
+  --trainer.checkpointer.interval 1000 \
+  --dump-folder outputs/stock_wandb50
+```
+
+### 2. ATO, 50 steps, WandB, no profiling
+
+Same as above, plus the ATO mount/env and override flags:
+
+```bash
+docker run --rm \
+  --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size 128g \
+  --security-opt seccomp=unconfined --cap-add=SYS_PTRACE --network=host \
+  -v ~/qwen3_kernel_study/torchtitan:/app/torchtitan/torchtitan \
+  -v ~/qwen3_kernel_study/outputs:/app/torchtitan/outputs \
+  -v ~/AMD-TorchTitan-Ops:/ato:ro -e PYTHONPATH=/ato \
+  -e WANDB_API_KEY=<your key> \
+  -w /app/torchtitan \
+  titanrl:mi355-rocm \
+  python3 -m torchtitan.rl.train --module alphabet_sort --config rl_grpo_qwen3_14b_no_compile \
+  --trainer.parallelism.tensor-parallel-degree 4 \
+  --generator.parallelism.tensor-parallel-degree 4 \
+  --async-loop.num-training-steps 50 \
+  --trainer.checkpointer.interval 1000 \
+  --trainer.override.imports amd_titan.ops.norm.rmsnorm,amd_titan.ops.rope.neox,amd_titan.ops.attention.varlen \
+  --generator.override.imports amd_titan.ops.attention.qk_norm_rope \
+  --dump-folder outputs/ato_wandb50
+```
+
+### 3. Trainer Kineto trace, stock, no-compile, 10 steps
+
+Same as #1, but drop `WANDB_API_KEY` (unneeded), restore the default step count, and
+add the trainer profiler flag:
+
+```bash
+docker run --rm \
+  --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size 128g \
+  --security-opt seccomp=unconfined --cap-add=SYS_PTRACE --network=host \
+  -v ~/qwen3_kernel_study/torchtitan:/app/torchtitan/torchtitan \
+  -v ~/qwen3_kernel_study/outputs:/app/torchtitan/outputs \
+  -e WANDB_MODE=disabled \
+  -w /app/torchtitan \
+  titanrl:mi355-rocm \
+  python3 -m torchtitan.rl.train --module alphabet_sort --config rl_grpo_qwen3_14b_no_compile \
+  --trainer.parallelism.tensor-parallel-degree 4 \
+  --generator.parallelism.tensor-parallel-degree 4 \
+  --trainer.checkpointer.interval 1000 \
+  --trainer.profiler.enable-profiling \
+  --dump-folder outputs/stock_trainer_nocompile_v2
+```
+
+### 4. Trainer Kineto trace, ATO, no-compile, 10 steps
+
+Same as #2, restore default step count, drop `WANDB_API_KEY`, add the profiler flag:
+
+```bash
+docker run --rm \
+  --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size 128g \
+  --security-opt seccomp=unconfined --cap-add=SYS_PTRACE --network=host \
+  -v ~/qwen3_kernel_study/torchtitan:/app/torchtitan/torchtitan \
+  -v ~/qwen3_kernel_study/outputs:/app/torchtitan/outputs \
+  -v ~/AMD-TorchTitan-Ops:/ato:ro -e PYTHONPATH=/ato \
+  -e WANDB_MODE=disabled \
+  -w /app/torchtitan \
+  titanrl:mi355-rocm \
+  python3 -m torchtitan.rl.train --module alphabet_sort --config rl_grpo_qwen3_14b_no_compile \
+  --trainer.parallelism.tensor-parallel-degree 4 \
+  --generator.parallelism.tensor-parallel-degree 4 \
+  --trainer.checkpointer.interval 1000 \
+  --trainer.override.imports amd_titan.ops.norm.rmsnorm,amd_titan.ops.rope.neox,amd_titan.ops.attention.varlen \
+  --generator.override.imports amd_titan.ops.attention.qk_norm_rope \
+  --trainer.profiler.enable-profiling \
+  --dump-folder outputs/ato_trainer_traced_nocompile
+```
+
+### 5. Generator traces (stock + ATO)
+
+No trainer, no compile, not part of the Monarch loop -- see
+`generator_trace_handbook.md` in this same directory for the full standalone
+`torchtitan/rl/generate.py` commands (`--config rl_grpo_qwen3_14b`, `--profile`,
+with/without `--override-imports amd_titan.ops.attention.qk_norm_rope`).
+
+### 6. Re-run the kernel-level diff on any pair
+
+```bash
+docker run --rm \
+  -v ~/qwen3_kernel_study/outputs:/outputs:ro \
+  -v ~/AMD-TorchTitan-Ops:/ato:ro \
+  --entrypoint python3 titanrl:mi355-rocm \
+  /ato/scripts/compare_kineto_traces.py \
+  /outputs/<leg-a>/profiling/traces/iteration_N/rank0_trace.json.gz \
+  /outputs/<leg-b>/profiling/traces/iteration_N/rank0_trace.json.gz \
+  --threshold 0.03
+```
+
+### Gotchas hit while producing this report (don't re-discover them)
+
+- Docker images are node-local -- a fresh Slurm allocation on a different physical
+  node needs a full rebuild, ~15-20 min.
+- Check `df -h /home` before any run that saves checkpoints -- this shared NFS mount
+  hit 99% full mid-investigation from accumulated checkpoint dirs across many past
+  runs (each full Qwen3-14B checkpoint is ~83GB), and a checkpoint write failing
+  partway through silently kills the whole job with zero traceback. Checkpoints
+  are root-owned (written from inside the container) -- delete them via a container
+  (`docker run --rm -v <outputs>:/outputs alpine rm -rf /outputs/*/checkpoint`), not
+  a plain host-side `rm`.
+- `--exclusive` on this cluster's `amd-spur` partition/`amd-burst-qos` QOS does not
+  reliably mean actually exclusive -- verify with `rocm-smi --showmeminfo vram` and
+  `docker ps -a` on every fresh allocation before trusting it. Use
+  `--qos=amd-aifw-aim-qos` instead of `amd-burst-qos` for a real dedicated node, and
+  `sinfo -p amd-spur -N -o "%N %T"` to find a node genuinely in `idle` state if the
+  first allocation isn't clean.
+- A queue_interposition hang (`Async signal handler still waiting on signal`) hit
+  the trainer's own profiler once, on a stock+no-compile+profiling combination that
+  had worked fine moments before on the ATO leg -- retried, ran clean the second
+  time. Treat it as flaky/timing-dependent, not a deterministic incompatibility with
+  a specific config.
