@@ -153,9 +153,10 @@ def set_determinism(
 
         from torchtitan.models.common.attention import FlexInnerAttention
 
-        if torch.version.hip is not None:
-            # Compiled ROCm flex attention is not deterministic.
-            # Falling back to eager (non-compiled) flex_attention for determinism on ROCm.
+        if torch.version.hip is not None and not debug_config.batch_invariant :
+            # rocm 10.0 seems to be determinstic so we can use the compiled version
+            # Batch invariant mode needs determinism
+            # <TODO> change non-batch invariant mode to also use compiled version
             logger.info(
                 "Using eager (non-compiled) flex_attention for determinism on ROCm."
             )
