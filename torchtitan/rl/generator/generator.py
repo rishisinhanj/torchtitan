@@ -42,6 +42,7 @@ from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.logging import init_logger
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.vllm.batch_invariance import (
+    force_flex_page_mapping_for_batch_invariance,
     force_logprobs_fn_for_batch_invariance,
 )
 from torchtitan.rl.generator.vllm.registry import (
@@ -973,6 +974,17 @@ class VLLMGenerator(Configurable):
             # The vLLM v2 logprob Triton kernel bypasses the aten overrides above;
             # route it through trainer's function to match the trainer exactly.
             force_logprobs_fn_for_batch_invariance()
+            if (
+                torch.version.hip is not None
+                and isinstance(attention_backend, FlexInnerAttention.Config)
+            ):
+                if self._max_num_seqs > 64:
+                    raise ValueError(
+                        "ROCm FlexAttention batch invariance supports at most 64 "
+                        "concurrent requests per generator, got "
+                        f"max_num_seqs={self._max_num_seqs}"
+                    )
+                force_flex_page_mapping_for_batch_invariance()
 
         self._set_determinism(config.debug)
 

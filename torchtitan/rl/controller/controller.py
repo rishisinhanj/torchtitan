@@ -373,15 +373,42 @@ class Controller(Configurable):
             # e.g. rollout max length cannot be larger than the model max_seq_len
             # or the packing len, etc.
 
+            if (
+                self.trainer.debug.batch_invariant
+                != self.generator.debug.batch_invariant
+            ):
+                raise ValueError(
+                    "trainer and generator must use the same batch_invariant setting"
+                )
+
             if self.trainer.debug.batch_invariant:
                 if torch.version.hip is not None:
+                    from torchtitan.models.common.attention import FlexInnerAttention
+
+                    trainer_attention = self.trainer.model.first_full_attention
+                    generator_attention = self.generator.model.first_full_attention
+                    if any(
+                        attention is None
+                        or not isinstance(
+                            attention.inner_attention,
+                            FlexInnerAttention.Config,
+                        )
+                        for attention in (trainer_attention, generator_attention)
+                    ):
+                        raise ValueError(
+                            "batch_invariant mode on ROCm requires FlexAttention "
+                            "for both trainer and generator; "
+                            "the ROCm varlen path does not support the deterministic "
+                            "configuration used for trainer-vLLM parity."
+                        )
+                if not (
+                    self.trainer.debug.deterministic
+                    and self.generator.debug.deterministic
+                ):
                     raise ValueError(
-                        "batch_invariant mode is not supported on ROCm: the varlen "
-                        "attention path cannot force num_splits=1 (rejected by ROCm), "
-                        "so split-k reductions are non-deterministic."
+                        "batch_invariant requires deterministic=True for both "
+                        "trainer and generator"
                     )
-                if not self.trainer.debug.deterministic:
-                    raise ValueError("batch_invariant requires deterministic=True")
                 # The trainer forward must compute in bf16 to match the bf16
                 # generator, via FSDP mixed precision. The trainer always wraps
                 # the model in FSDP (even at data_parallel_shard_degree=1, where

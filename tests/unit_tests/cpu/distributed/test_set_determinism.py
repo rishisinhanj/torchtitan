@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import torch
+
 from torchtitan.config import DebugConfig
 from torchtitan.distributed.utils import set_determinism
 
@@ -107,6 +108,83 @@ class TestSetDeterminismWithFakeMesh(unittest.TestCase):
             del os.environ["PYTHONHASHSEED"]
         if "CUBLAS_WORKSPACE_CONFIG" in os.environ:
             del os.environ["CUBLAS_WORKSPACE_CONFIG"]
+
+    @staticmethod
+    def _single_process_context():
+        context = MagicMock()
+        context.world_size = 1
+        context.world_mesh = MagicMock()
+        context.get_mesh.return_value = None
+        context.get_optional_mesh.return_value = None
+        context.get_all_meshes.return_value = {}
+        return context
+
+    def test_rocm_batch_invariant_compiles_flex_attention(self):
+        from torchtitan.models.common.attention import FlexInnerAttention
+
+        original_fn = FlexInnerAttention._compiled_flex_attn
+        original_configs = FlexInnerAttention.inductor_configs.copy()
+        compiled_fn = MagicMock()
+
+        try:
+            with (
+                patch.object(torch.version, "hip", "10.0"),
+                patch("torch.compile", return_value=compiled_fn) as mock_compile,
+            ):
+                set_determinism(
+                    parallelism_context=self._single_process_context(),
+                    device=self.device,
+                    debug_config=DebugConfig(
+                        deterministic=True,
+                        batch_invariant=True,
+                    ),
+                    distinct_seed_mesh_axes=[],
+                )
+
+            mock_compile.assert_called_once()
+            self.assertIs(FlexInnerAttention._compiled_flex_attn, compiled_fn)
+            self.assertFalse(
+                FlexInnerAttention.inductor_configs["max_autotune"]
+            )
+            self.assertFalse(
+                FlexInnerAttention.inductor_configs[
+                    "coordinate_descent_tuning"
+                ]
+            )
+        finally:
+            FlexInnerAttention._compiled_flex_attn = original_fn
+            FlexInnerAttention.inductor_configs.clear()
+            FlexInnerAttention.inductor_configs.update(original_configs)
+
+    def test_rocm_deterministic_non_batch_invariant_uses_eager_flex(self):
+        from torch.nn.attention.flex_attention import flex_attention
+
+        from torchtitan.models.common.attention import FlexInnerAttention
+
+        original_fn = FlexInnerAttention._compiled_flex_attn
+
+        try:
+            with (
+                patch.object(torch.version, "hip", "10.0"),
+                patch("torch.compile") as mock_compile,
+            ):
+                set_determinism(
+                    parallelism_context=self._single_process_context(),
+                    device=self.device,
+                    debug_config=DebugConfig(
+                        deterministic=True,
+                        batch_invariant=False,
+                    ),
+                    distinct_seed_mesh_axes=[],
+                )
+
+            mock_compile.assert_not_called()
+            self.assertIs(
+                FlexInnerAttention._compiled_flex_attn,
+                flex_attention,
+            )
+        finally:
+            FlexInnerAttention._compiled_flex_attn = original_fn
 
     @patch("torch.distributed.distributed_c10d.get_world_size")
     @patch("torch.distributed.distributed_c10d.get_rank")

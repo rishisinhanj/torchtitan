@@ -140,3 +140,79 @@ def test_vllm_logprob_patch_keeps_trainer_fallback_path(monkeypatch):
         assert call_logits is logits
         torch.testing.assert_close(call_labels, token_ids[:, column].to(torch.int64))
         assert call_kwargs == {"vocab_parallel_group": None}
+
+
+def test_vllm_flex_page_mapping_uses_global_page_ownership(monkeypatch):
+    """The ROCm Flex patch preserves request isolation and shared-prefix pages."""
+    module_path = (
+        Path(__file__).resolve().parents[4]
+        / "torchtitan/rl/generator/vllm/batch_invariance.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "torchtitan_flex_page_mapping_test", module_path
+    )
+    assert spec is not None and spec.loader is not None
+    batch_invariance = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(batch_invariance)
+
+    module_names = (
+        "vllm",
+        "vllm.v1",
+        "vllm.v1.attention",
+        "vllm.v1.attention.backends",
+        "vllm.v1.attention.backends.flex_attention",
+    )
+    modules = {name: ModuleType(name) for name in module_names}
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+        if name != module_names[-1]:
+            module.__path__ = []
+        if "." in name:
+            parent_name, child_name = name.rsplit(".", 1)
+            setattr(modules[parent_name], child_name, module)
+
+    class FakeFlexAttentionMetadata:
+        def get_paged_mask_mod(self):
+            return "original"
+
+    modules[module_names[-1]].FlexAttentionMetadata = FakeFlexAttentionMetadata
+    batch_invariance.force_flex_page_mapping_for_batch_invariance()
+
+    metadata = FakeFlexAttentionMetadata()
+    metadata.num_reqs = 2
+    # Page 1 is a shared prefix at logical block 0. Pages 2 and 3 belong
+    # exclusively to requests 0 and 1, respectively.
+    metadata.physical_to_logical = torch.tensor(
+        [
+            [-1, 0, 1, -1],
+            [-1, 0, -1, 1],
+        ]
+    )
+    # vLLM stores request IDs as int32. Keep this dtype here so requests above
+    # index 31 cannot silently overflow the ownership shift.
+    metadata.doc_ids = torch.tensor([0, 0, 1, 1], dtype=torch.int32)
+    metadata.query_start_loc = torch.tensor([0, 2])
+    metadata.decode_offset = torch.tensor([0, 0])
+    metadata.block_size = 1
+    metadata.logical_mask_mod = (
+        lambda _batch, _head, query_index, kv_index: kv_index <= query_index
+    )
+
+    mask = metadata.get_paged_mask_mod()
+    zero = torch.tensor(0)
+    assert mask(zero, zero, torch.tensor(1), torch.tensor(2))
+    assert not mask(zero, zero, torch.tensor(1), torch.tensor(3))
+    assert mask(zero, zero, torch.tensor(2), torch.tensor(1))
+    assert not mask(zero, zero, torch.tensor(2), torch.tensor(2))
+
+    metadata.num_reqs = 33
+    metadata.physical_to_logical = torch.full((33, 2), -1)
+    metadata.physical_to_logical[32, 1] = 0
+    metadata.doc_ids = torch.tensor([32], dtype=torch.int32)
+    metadata.query_start_loc = torch.zeros(33, dtype=torch.int32)
+    metadata.decode_offset = torch.zeros(33, dtype=torch.int32)
+    assert metadata.get_paged_mask_mod()(zero, zero, zero, torch.tensor(1))
+
+    metadata.num_reqs = 65
+    with pytest.raises(ValueError, match="at most 64"):
+        metadata.get_paged_mask_mod()
