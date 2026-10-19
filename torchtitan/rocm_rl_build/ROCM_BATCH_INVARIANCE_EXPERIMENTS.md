@@ -231,53 +231,118 @@ Result: identical failures and deltas to the original 16-token vLLM baseline.
 
 Conclusion: logical block-size alignment is not sufficient.
 
+## Intermediate localization
+
+An opt-in, single-sequence diagnostic synchronized trainer weights into vLLM,
+disabled vLLM graph replay, and captured every Qwen3 layer on both TP ranks.
+With the default vLLM Flex configuration:
+
+- Embeddings, layer inputs, norms, and post-RoPE Q/K/V were bitwise equal
+  through layer 2.
+- Reconstructing layer 2 K/V from vLLM's block table and packed paged cache
+  produced tensors bitwise equal to vLLM's logical K/V inputs on both ranks.
+- Replaying those Q/K/V through contiguous compiled Flex was bitwise equal to
+  the trainer's padded contiguous Flex output.
+- The first unequal value was vLLM's paged Flex output on TP rank 0 at
+  `(token=86, local_head=6, dim=91)`: one of 153,600 elements differed by
+  `2.441406e-4`.
+- TP rank 1's attention output was still equal. Its first drift appeared in
+  `wo`, after the TP reduction incorporated rank 0's unequal value.
+
+This rules out weight transfer, embeddings, RoPE, Q/K/V projection, KV-cache
+contents, and the trainer's block padding as the first cause. The remaining
+failure is specifically the paged Flex computation/metadata path. Aligning the
+vLLM cache and logical blocks to 128 moved the first error to layer 0 rather
+than fixing it.
+
+### Exact paged replay and fix
+
+The diagnostic now saves rank-local Q/K/V, attention outputs, the used cache
+pages, and vLLM's actual `BlockMask` tensors. The saved replay reproduces both
+outputs exactly.
+
+The layer-2 mismatch was one BF16 ULP:
+
+```text
+index:    token 86, local query head 6, value dimension 91
+trainer:  -0.0468750000  (BF16 0xbd40)
+vLLM:     -0.0466308594  (BF16 0xbd3f)
+FP64 ref: -0.0467443086  (rounds to vLLM's 0xbd3f)
+```
+
+The trigger was vLLM's request-dependent two-dimensional lookup inside its
+paged mask:
+
+```text
+physical_to_logical[query_request, physical_kv_block]
+```
+
+Flattening that same lookup still reproduced vLLM's one-ULP result. Replacing
+it with logically equivalent global per-page metadata reproduced the trainer
+exactly. The fix computes a global physical-page-to-logical-block vector and a
+64-bit request-ownership mask before Flex compilation. Shared prefix pages can
+belong to multiple requests without reintroducing the request-indexed table.
+
+With that patch, the complete ROCm Flex parity class passed:
+
+- Trainer batch invariance: zero differences.
+- Every captured intermediate on both TP ranks: zero differences.
+- Trainer versus vLLM prefill for five mixed-length prompts: zero differences.
+- vLLM decode versus second prefill for five prompts: zero differences.
+
+```text
+4 passed
+```
+
+### Two-step TitanRL result
+
+The saved `scripts/run_rocm_flex_bi_two_step.sh` recipe ran two optimizer steps
+with two trainer and two generator GPUs. vLLM CUDA-graph replay was disabled
+after its first rollout caused a ROCm HSA memory fault; compiled FlexAttention
+remained enabled.
+
+```text
+Train | Step: 1 ... bit_wise/logprob_diff/max: 0
+Train | Step: 2 ... bit_wise/logprob_diff/max: 0
+```
+
+Step 2 includes an optimizer update and trainer-to-generator weight transfer,
+so this validates more than initial-checkpoint parity.
+
+Final logs from the reviewed implementation:
+
+- Full Flex parity:
+  `outputs/rocm_flex_parity_global_map_int64/diagnostic.log`
+- Two-step TitanRL:
+  `outputs/rocm_flex_bi_two_step_final/two_step.log`
+
 ## Current conclusions
 
 1. Compiled trainer FlexAttention is deterministic and batch-invariant on the
    tested ROCm 10 gfx950 stack.
-2. vLLM generator decode and prefill can be bitwise identical on ROCm when
-   using the production 256-token cache block.
-3. Trainer-to-vLLM prefill parity is still not bitwise exact.
-4. The remaining drift is unaffected by:
-   - vLLM's batch-invariant environment flag;
-   - 16x16 kernel-tile alignment;
-   - `num_stages=2`;
-   - matching logical Flex block sizes;
-   - matching cache and logical block sizes.
-5. A full two-step TitanRL run cannot satisfy zero logprob difference while
-   the simpler trainer-versus-vLLM prefill test already fails.
-6. The blanket ROCm controller rejection should remain until the remaining
-   trainer-to-vLLM drift is localized and fixed.
+2. The paged Flex drift was caused by request-indexed mask metadata changing
+   the ROCm kernel's accumulation, not by incorrect Q/K/V or cache contents.
+3. Global page mapping restores complete trainer-vLLM and decode-prefill
+   parity for the tested plain-attention model.
+4. Two TitanRL steps both report `bit_wise/logprob_diff/max: 0`.
+5. ROCm batch invariance can be enabled for FlexAttention while retaining the
+   controller rejection for unsupported ROCm attention backends.
+6. vLLM CUDA-graph replay remains a separate ROCm runtime issue; the successful
+   validation used eager graph execution with compiled FlexAttention.
+7. The ownership representation supports at most 64 concurrent requests per
+   generator. ROCm Flex batch-invariant startup rejects a larger
+   `max_num_seqs` instead of silently returning to the drifting lookup.
 
 ## Current upstream patch boundary
 
-The smallest evidence-backed TorchTitan change is:
+The evidence-backed TorchTitan change is:
 
 - Use compiled FlexAttention for ROCm batch-invariant trainer determinism.
+- Replace vLLM's request-indexed paged-mask lookup with global page metadata
+  only for ROCm Flex batch-invariant generation.
 - Preserve the existing eager fallback for ordinary deterministic ROCm runs.
-- Add unit coverage for that dispatch decision.
-- Keep the controller's ROCm rejection, with an error message describing the
-  current trainer-to-vLLM parity limitation.
+- Narrow the controller's ROCm rejection to non-Flex attention.
+- Keep CUDA behavior unchanged.
 
 The Dockerfile and local vLLM wheel are validation infrastructure and should
 not be presented as the upstream batch-invariance fix.
-
-## Next diagnostic
-
-Run one matched single-sequence prefill and capture the first differing
-intermediate between trainer and vLLM:
-
-1. Embeddings and position tensors.
-2. First-layer Q, K, and V after RoPE.
-3. Attention output before the output projection.
-4. Output projection, residual, and normalization tensors.
-5. Final logits and logprobs.
-
-If Q/K/V are bitwise equal but the attention output differs, replay identical
-captured Q/K/V through:
-
-- the trainer's contiguous compiled Flex path; and
-- vLLM's paged-KV compiled Flex path.
-
-That experiment will distinguish kernel math from KV-cache write/read layout
-without further speculative tile or stage changes.
