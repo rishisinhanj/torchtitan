@@ -1,0 +1,260 @@
+###############################################################################
+# =============================================================================
+# Dockerfile.titanrl-rocm-flex-bi
+#   TitanRL ROCm image targeting BATCH-INVARIANT MODE over FLEX ATTENTION on
+#   MI350X/MI355X (gfx950).
+#
+#   Build context = torchtitan repo root:
+#     docker build -t titanrl:rocm100-flex-bi \
+#       -f torchtitan/rl/.../Dockerfile.titanrl-rocm-flex-bi .
+#
+#   Derived from Dockerfile.titanrl-rocm. Three deltas, each explained at its
+#   layer below:
+#     1. BASE_IMAGE defaults to the rocm100 base, not plain `nightly`.
+#     2. batch_invariant_ops is installed (batch-invariant mode requires it).
+#     3. AITER is no longer a hard gate -- the flex route never calls it.
+#
+#   WHY rocm10.0 AND NOT rocm7.2. Compiled FlexAttention on gfx950 hits an
+#   AMDGPU LDS layout-convert data race (llvm/llvm-project#206825,
+#   ROCm/triton#953, torchtitan#3960). Measured on gfx950 2026-10-12, same node
+#   and same script (scripts/flex_backward_nondeterminism.py):
+#     torch 2.15.0.dev20260827+rocm7.2  / triton 3.8.0 -> NON-DETERMINISTIC
+#                                          out(fwd) 2.06e-01, dv exactly 0
+#     torch 2.16.0.dev20261012+rocm10.0 / triton 3.9.0 -> DETERMINISTIC,
+#                                          300 iters bitwise exact
+#   rocm10.0 is also what torchtitan CI itself consumes (set-matrix.yaml:92,
+#   `index-url: .../nightly/rocm10.0`), so this tracks upstream rather than
+#   diverging from it. The race is why #3896 forces eager flex on ROCm; on a
+#   rocm10.x runtime that fallback is no longer load-bearing.
+#
+#   WHY THIS IMAGE EXERCISES COMPILED FLEX. The trainer and vLLM generator must
+#   use comparable compiled attention paths before end-to-end parity can be
+#   evaluated. TorchTitan now supplies a fixed-schedule bmm override too, so the
+#   old eager-bmm limitation is no longer the reason for selecting this path.
+#
+#   `base-nightly-rocm100` is a moving tag. Pin a dated one once a build is
+#   known good -- there are SHA-suffixed variants:
+#     --build-arg BASE_IMAGE=vllm/vllm-openai-rocm:base-nightly-rocm100-<sha>
+#
+#   Base image verified 2026-10-14 to carry: PYTHON_VERSION=3.12 (torchmonarch
+#   publishes cp310-cp313 only, so the py3.14 rocm/vllm tags are unusable),
+#   PYTORCH_ROCM_ARCH including gfx950, and a pip-layout ROCm SDK under
+#   _rocm_sdk_devel.
+# =============================================================================
+
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:nightly-rocm100
+ARG TORCHTITAN_HOME=/app/torchtitan
+
+FROM ${BASE_IMAGE}
+
+ARG TORCHTITAN_HOME
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV TORCHTITAN_HOME=${TORCHTITAN_HOME}
+ENV PYTHONPATH=${TORCHTITAN_HOME}
+ENV NCCL_DEBUG=WARN
+# PYTORCH_ROCM_ARCH is deliberately NOT set: the base image already lists
+# gfx950 among its targets, and overriding it here would narrow that.
+
+WORKDIR ${TORCHTITAN_HOME}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    git \
+    libibverbs1 \
+    ibverbs-providers \
+    rdma-core \
+    && rm -rf /var/lib/apt/lists/*
+
+# The rocm100 base ships a RELEASE torch (2.12.0+rocm10.0.0), which predates
+# PyTorch PR #180428 -- the FSDP2 chunked-loss partial-group-backward fix that
+# TitanRL's ChunkedLossWrapper needs, and every batch-invariant config uses it.
+# Upgrade to the rocm10.0 nightly, which carries the fix.
+#
+# --no-deps so pip cannot pull a CUDA wheel or disturb the base's vLLM.
+# Verified 2026-10-18 inside this base: after the upgrade torch is
+# 2.16.0.dev20261018+rocm10.0 and the PR #180428 fix is present.
+RUN python3 -m pip install --no-cache-dir --pre --no-deps --upgrade torch \
+    --index-url https://download.pytorch.org/whl/nightly/rocm10.0
+
+COPY . ${TORCHTITAN_HOME}/
+
+# Core torchtitan plus its own pyproject deps. No hand-maintained package list:
+# if torchtitan adds a dependency, this picks it up.
+# --pre and the ROCm index keep dependency resolution on the already-installed
+# ROCm nightly instead of replacing it with the latest stable CUDA torch.
+RUN python3 -m pip install --no-cache-dir --pre -e . \
+    --extra-index-url https://download.pytorch.org/whl/nightly/rocm10.0
+
+RUN python3 -m pip install --no-cache-dir -r torchtitan/rl/requirements.txt
+
+# --no-deps so pip cannot swap the base image's ROCm torch for a CUDA wheel.
+RUN python3 -m pip install --no-cache-dir --no-deps \
+    "git+https://github.com/meta-pytorch/torchstore.git@main"
+
+# DELTA 2: batch-invariant mode's Triton kernels. Not in torchtitan's
+# requirements (it is an optional mode), and absent from every prior TitanRL
+# image, so batch-invariant runs failed at import. --no-deps so it cannot pull
+# a CUDA torch. Verified on gfx950 2026-10-12: imports, registers, and
+# mm is batch-invariant and bitwise stable over 30 reps.
+RUN python3 -m pip install --no-cache-dir --no-deps \
+    "git+https://github.com/thinking-machines-lab/batch_invariant_ops.git@main"
+
+# Math-Verify etc. Only needed for the dapo_math example; harmless otherwise.
+RUN python3 -m pip install --no-cache-dir \
+    -r torchtitan/rl/examples/dapo_math/requirements.txt
+
+# FlyDSL aborts at runtime with a native MLIR double-registration error when
+# AITER routes through it, so remove it and make AITER's import of it optional.
+# The patch is a no-op when the base image's AITER no longer has that import --
+# the base tag moves, and a missing import means the problem is already gone.
+RUN python3 -m pip uninstall -y flydsl || true
+
+# DELTA 3: AITER absence is a warning, not a build failure.
+# AITER serves the varlen / CUSTOM generator backend. The flex route never
+# calls it, and varlen is a dead end for ROCm batch invariance regardless:
+# torch's ROCm _flash_attention_forward rejects num_splits outright, and the
+# ROCm varlen path rejects a paged block_table, so the generator cannot run the
+# trainer's varlen kernel at all (pytorch/torchtitan#4866 measured 0 steps
+# completed). Keeping AITER when the base provides it costs nothing and leaves
+# the varlen path available; requiring it would fail this build over a
+# dependency the flex route ignores.
+RUN python3 - <<'PY'
+import importlib.util
+import pathlib
+
+# find_spec locates aiter without executing it, so this works with no GPU
+# present (importing aiter at build time does not).
+spec = importlib.util.find_spec("aiter")
+if spec is None or spec.origin is None:
+    print("AITER absent from base image: varlen/CUSTOM generator unavailable, "
+          "flex route unaffected")
+    raise SystemExit(0)
+
+mha = pathlib.Path(spec.origin).parent / "ops" / "mha.py"
+sentinel = "flydsl_flash_attn_varlen_func = lambda *args, **kwargs: None"
+text = mha.read_text() if mha.exists() else ""
+
+for indent in ("    ", "        "):
+    old = f"{indent}from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func\n"
+    if old in text:
+        new = (
+            f"{indent}# Treat FlyDSL as optional; None falls through to the next AITER path.\n"
+            f"{indent}try:\n"
+            f"{indent}    from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func\n"
+            f"{indent}except ModuleNotFoundError:\n"
+            f"{indent}    {sentinel}\n"
+        )
+        mha.write_text(text.replace(old, new, 1))
+        print(f"patched optional flydsl import in {mha}")
+        break
+else:
+    print(f"no flydsl import to patch in {mha} (already optional, or gone upstream)")
+PY
+
+# The base image carries a `triton` distribution while the ROCm nightly torch
+# requires `triton-rocm`. Their files overlap under site-packages/triton, so
+# installing the nightly on top leaves a mixed package. Remove both and
+# reinstall the exact triton-rocm build declared by the installed torch.
+RUN TRITON_ROCM_REQUIREMENT="$(python3 -c \
+        'from importlib.metadata import requires; from packaging.requirements import Requirement; print(next(req for value in requires("torch") or [] if (req := Requirement(value)).name == "triton-rocm"))')" \
+    && python3 -m pip uninstall -y triton triton-rocm \
+    && python3 -m pip install --no-cache-dir --no-deps \
+        "${TRITON_ROCM_REQUIREMENT}" \
+        --index-url https://download.pytorch.org/whl/nightly/rocm10.0
+
+# vLLM promotes libtorch_cpu.so to RTLD_GLOBAL before importing torch so GPU
+# profiling can discover rocprofiler_configure. With torch 2.16 ROCm nightlies,
+# that changes native symbol resolution and segfaults when Triton's libtriton
+# is subsequently loaded. Disable only this optional profiling setup; keep
+# vLLM's Inductor compatibility patches intact.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+path = Path("/usr/local/lib/python3.12/dist-packages/vllm/env_override.py")
+text = path.read_text()
+old = "\n_maybe_promote_torch_symbols_for_rocm()\n"
+if text.count(old) != 1:
+    raise SystemExit(
+        "expected exactly one vLLM ROCm symbol-promotion call; "
+        "the base image changed and this workaround must be revalidated"
+    )
+path.write_text(
+    text.replace(
+        old,
+        "\n# Disabled: RTLD_GLOBAL libtorch conflicts with Triton on this ROCm nightly.\n",
+        1,
+    )
+)
+PY
+
+# Everything below is a hard gate. A clean build means the runtime is right;
+# there is no silent-failure path here. Note `aiter` is NOT in this list --
+# see DELTA 3 above.
+RUN python3 - <<'PY'
+import importlib.metadata
+import importlib.util
+import inspect
+import torch
+import monarch.actor  # noqa: F401
+import torchstore  # noqa: F401
+import batch_invariant_ops  # noqa: F401
+import vllm  # noqa: F401
+from torch._inductor import lowering
+
+for name in ["monarch", "torchstore", "vllm", "torchtitan", "batch_invariant_ops"]:
+    if importlib.util.find_spec(name) is None:
+        raise SystemExit(f"missing required package: {name}")
+
+if importlib.util.find_spec("flydsl") is not None:
+    raise SystemExit("flydsl must not be importable")
+
+if torch.version.hip is None:
+    raise SystemExit(f"expected ROCm torch, got {torch.__version__}")
+
+if type(lowering.FALLBACK_ALLOW_LIST).__name__ != "_VllmFallbackAllowList":
+    raise SystemExit("vLLM's Inductor fallback allow-list patch was not applied")
+
+# The whole point of this image is a ROCm where compiled flex is race-free.
+# A rocm7.x base silently reintroduces llvm#206825 and makes batch-invariant
+# flex unusable, so fail loudly rather than produce a plausible-looking image.
+#
+# Check the wheel's +rocmX.Y local version, NOT torch.version.hip: a
+# 2.16.0.dev+rocm10.0 build reports torch.version.hip == "7.15.26333", so a
+# naive major-version test on that string rejects exactly the images we want.
+import re
+
+rocm_tag = re.search(r"\+rocm(\d+)\.(\d+)", torch.__version__)
+if rocm_tag is None:
+    raise SystemExit(
+        f"cannot read a +rocmX.Y tag from torch {torch.__version__}; "
+        "this image expects a ROCm wheel"
+    )
+if int(rocm_tag.group(1)) < 10:
+    raise SystemExit(
+        f"expected a ROCm 10.x runtime, got torch {torch.__version__}. "
+        "Compiled FlexAttention is non-deterministic on gfx950 below 10.x "
+        "(llvm/llvm-project#206825); use BASE_IMAGE=...:nightly-rocm100"
+    )
+
+# PyTorch PR #180428 fixes the FSDP2 chunked-loss partial-group-backward crash
+# that TitanRL's ChunkedLossWrapper hits. The old pinned base image predated it
+# and had to be upgraded; assert the nightly base actually carries it.
+import torch.distributed.fsdp._fully_shard._fsdp_param_group as fsdp_param_group
+
+if "is_partial_group_backward" not in inspect.getsource(fsdp_param_group):
+    raise SystemExit(
+        f"PyTorch PR #180428 fix absent in torch {torch.__version__} -- "
+        "the base image's torch is too old; pin a newer BASE_IMAGE"
+    )
+
+print("torch", torch.__version__)
+print("hip", torch.version.hip)
+print("vllm", importlib.metadata.version("vllm"))
+print("batch_invariant_ops present")
+print("PR #180428 fix confirmed present")
+PY
+
+ENTRYPOINT []
+CMD ["sleep", "infinity"]
