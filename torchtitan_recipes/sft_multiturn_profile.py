@@ -6,11 +6,14 @@
 
 """Profiled Qwen3-8B GSM8K SFT configurations for a multi-turn vs single-turn study.
 
-Both configurations derive from ``sft_qwen3_8b_math``, use the same Qwen3
-renderer, and differ only in the number of messages each GSM8K sample becomes:
-the subject expands a sample into two user/assistant round trips, the control
-keeps the base recipe's single round trip. Routing both through the renderer
-keeps the tokenization path identical, so turn count is the only variable.
+All three configurations derive from ``sft_qwen3_8b_math`` and use the same
+Qwen3 renderer, so the tokenization path is identical and only the messages
+differ. The control keeps the base recipe's single round trip. The two
+multi-turn recipes answer different questions: ``multiturn`` doubles the
+content across two round trips, which measures whether a longer corpus pushes
+the data producer onto the critical path, while ``multiturn_token_matched``
+splits the same content across two round trips, which isolates what the
+four-message structure costs per sample.
 
 ``reasoning_content`` has to sit on the FINAL assistant turn. Qwen3's renderer
 emits a thinking block only for messages after the last user turn
@@ -102,6 +105,37 @@ def sft_qwen3_8b_multiturn_profiled() -> Trainer.Config:
     return config
 
 
+def sft_qwen3_8b_multiturn_token_matched_profiled() -> Trainer.Config:
+    """Qwen3-8B SFT on GSM8K split across two round trips at matched length.
+
+    Carries the same supervised content as the control at roughly the same
+    token count, so a per-document comparison against the control attributes
+    cost to the four-message structure rather than to length.
+    ``sft_qwen3_8b_multiturn_profiled`` instead doubles the content, which
+    measures capacity rather than per-sample structure.
+    """
+
+    def messages_fn(sample) -> list[Message]:
+        answer = sample["answer"]
+        reasoning, final_answer = answer.rsplit("####", 1)
+        steps = reasoning.strip().split("\n")
+        half = max(1, len(steps) // 2)
+        return [
+            {"role": "user", "content": sample["question"]},
+            {"role": "assistant", "content": "\n".join(steps[:half])},
+            {"role": "user", "content": "Continue."},
+            {
+                "role": "assistant",
+                "reasoning_content": "\n".join(steps[half:]),
+                "content": final_answer.strip(),
+            },
+        ]
+
+    config = _profiled_base()
+    _chat_processor(config).messages_fn = messages_fn
+    return config
+
+
 def sft_qwen3_8b_singleturn_profiled() -> Trainer.Config:
-    """Single-turn control for ``sft_qwen3_8b_multiturn_profiled``."""
+    """Single-turn control for both multi-turn recipes."""
     return _profiled_base()
