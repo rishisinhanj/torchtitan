@@ -489,7 +489,7 @@ def test_trace_arms_profile_the_same_step_in_trainer_and_generators(
     assert trainer_profiler.profile_freq == 8
     assert generator_profiler.start_step == 8
     # An eager MoE decode step records ~150K CPU ops; graphs record a few hundred.
-    assert generator_profiler.max_iterations == (64 if model == "30b_a3b_base_ep1" else 256)
+    assert generator_profiler.max_iterations == (16 if model == "30b_a3b_base_ep1" else 256)
 
 
 @pytest.mark.parametrize(
