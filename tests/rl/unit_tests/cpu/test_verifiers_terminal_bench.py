@@ -434,6 +434,10 @@ def test_recipe_layouts_fit_the_model(
         f"rl_grpo_qwen3_{model}_tb_{arm}"
         for model in ("8b_base", "30b_a3b_base", "30b_a3b_base_ep1")
         for arm in ("shakedown", "mt", "st")
+    ]
+    + [
+        "rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt",
+        "rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_st",
     ],
 )
 def test_trace_recipe_layouts_fit_one_8_gpu_host(name: str) -> None:
@@ -469,7 +473,9 @@ def test_trace_recipe_layouts_fit_one_8_gpu_host(name: str) -> None:
 
 
 @pytest.mark.parametrize("arm", ["mt", "st"])
-@pytest.mark.parametrize("model", ["8b_base", "30b_a3b_base", "30b_a3b_base_ep1"])
+@pytest.mark.parametrize(
+    "model", ["8b_base", "30b_a3b_base", "30b_a3b_base_ep1", "30b_a3b_base_ep1_graphs"]
+)
 def test_trace_arms_profile_the_same_step_in_trainer_and_generators(
     model: str, arm: str
 ) -> None:
@@ -489,7 +495,10 @@ def test_trace_arms_profile_the_same_step_in_trainer_and_generators(
     assert trainer_profiler.profile_freq == 8
     assert generator_profiler.start_step == 8
     # An eager MoE decode step records ~150K CPU ops; graphs record a few hundred.
-    assert generator_profiler.max_iterations == (16 if model == "30b_a3b_base_ep1" else 256)
+    max_iterations = {"30b_a3b_base_ep1": 16, "30b_a3b_base_ep1_graphs": 64}
+    assert generator_profiler.max_iterations == max_iterations.get(model, 256)
+    if model == "30b_a3b_base_ep1_graphs":
+        assert config.generator.engine.cuda_graph.mode == "FULL_DECODE_ONLY"
 
 
 @pytest.mark.parametrize(

@@ -19,7 +19,8 @@ three arms:
 
 Qwen3-30B-A3B-Base also runs every arm with four one-GPU generators (``ep1``)
 instead of one expert-parallel generator, whose all-to-all decode step took
-about 150 ms per token.
+about 150 ms per token, and ``mt``/``st`` on them with decode CUDA graphs
+(``ep1_graphs``).
 
 Base models score about 0 on these tasks, so zero-variance reward groups are
 trained on instead of dropped; dropping them ends a run after 10 untrainable
@@ -283,18 +284,21 @@ def _qwen3_30b_a3b_base(arm: _Arm, *, name: str) -> Controller.Config:
     return config
 
 
-def _qwen3_30b_a3b_base_ep1(arm: _Arm, *, name: str) -> Controller.Config:
+def _qwen3_30b_a3b_base_ep1(
+    arm: _Arm, *, name: str, cuda_graphs: bool = False
+) -> Controller.Config:
     """Qwen3-30B-A3B-Base: the trainer of ``_qwen3_30b_a3b_base`` and four one-GPU
     generators (TP=1, EP=1).
 
     Without expert parallelism a decode step has no all-to-all, no split sizes
-    copied to the host and no TP all-reduce. It still runs eagerly: on ROCm,
-    ``torch._grouped_mm`` copies its group offsets to the host, which CUDA graph
-    capture does not allow.
+    copied to the host and no TP all-reduce. ``torch._grouped_mm``'s ROCm fallback
+    copies its group offsets to the host, which CUDA graph capture does not allow;
+    with ``cuda_graphs`` the generators capture decode graphs, which needs the
+    CK-tile grouped GEMM the vLLM generator enables on ROCm.
 
     An eager decode step records ~150K CPU ops in the generator profiler, and writing 32
     steps of them stalls each engine for ~8 minutes, so its window is 16 engine steps
-    instead of 256.
+    instead of 256. With decode graphs only prefill steps run eagerly: 64 steps.
     """
     config = _qwen3_base_terminal_bench_trace(
         "30B-A3B",
@@ -309,11 +313,13 @@ def _qwen3_30b_a3b_base_ep1(arm: _Arm, *, name: str) -> Controller.Config:
         ),
         generator_parallelism=InferenceParallelismConfig(),
         num_generators=4,
-        generator_cuda_graph_mode="NONE",
+        generator_cuda_graph_mode="FULL_DECODE_ONLY" if cuda_graphs else "NONE",
     )
     config.generator.gpu_memory_limit = 0.8
     if config.generator.engine.profiler is not None:
-        config.generator.engine.profiler = VLLMProfilerConfig(max_iterations=16)
+        config.generator.engine.profiler = VLLMProfilerConfig(
+            max_iterations=64 if cuda_graphs else 16
+        )
     return config
 
 
@@ -364,3 +370,17 @@ def rl_grpo_qwen3_30b_a3b_base_ep1_tb_mt() -> Controller.Config:
 def rl_grpo_qwen3_30b_a3b_base_ep1_tb_st() -> Controller.Config:
     """Qwen3-30B-A3B-Base single-turn control on four one-GPU generators."""
     return _qwen3_30b_a3b_base_ep1("st", name="rl_grpo_qwen3_30b_a3b_base_ep1_tb_st")
+
+
+def rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt() -> Controller.Config:
+    """Qwen3-30B-A3B-Base multi-turn trace on four one-GPU generators with decode graphs."""
+    return _qwen3_30b_a3b_base_ep1(
+        "mt", name="rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt", cuda_graphs=True
+    )
+
+
+def rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_st() -> Controller.Config:
+    """Qwen3-30B-A3B-Base single-turn control on four one-GPU generators with decode graphs."""
+    return _qwen3_30b_a3b_base_ep1(
+        "st", name="rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_st", cuda_graphs=True
+    )
