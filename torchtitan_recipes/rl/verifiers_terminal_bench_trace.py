@@ -13,7 +13,8 @@ three arms:
 - ``shakedown``: 3 steps, 2 samples per prompt, 4 agent turns, no profiling; the
   rollout recorder keeps every rollout.
 - ``mt``: multi-turn trace, 12 steps of 4 prompts x 8 samples, 24 agent turns; the
-  trainer profiler traces step 8.
+  trainer profiler traces step 8, and the generator profiler the first 256 engine
+  steps from the start of step 8.
 - ``st``: ``mt`` with one agent turn, the single-turn control.
 
 Base models score about 0 on these tasks, so zero-variance reward groups are
@@ -50,7 +51,7 @@ from torchtitan.rl.examples.verifiers.rollouter import VerifiersRollouter
 from torchtitan.rl.generator.generator import Generator
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.types import SamplingConfig
-from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig
+from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig, VLLMProfilerConfig
 from torchtitan.rl.generator.vllm.engine import VLLMEngine
 from torchtitan.rl.observability.metrics import MetricsProcessor
 from torchtitan.rl.rollout.recorder import (
@@ -217,7 +218,9 @@ def _qwen3_base_terminal_bench_trace(
         generator=Generator.Config(
             model=generator_model,
             engine=VLLMEngine.Config(
-                cuda_graph=VLLMCudaGraphConfig(mode=generator_cuda_graph_mode)
+                cuda_graph=VLLMCudaGraphConfig(mode=generator_cuda_graph_mode),
+                # Starts with step 8, the step the trainer profiler traces.
+                profiler=None if is_shakedown else VLLMProfilerConfig(),
             ),
             parallelism=generator_parallelism,
             checkpointer=None,

@@ -38,7 +38,7 @@ from torchtitan.rl.generator.dispatcher import (
 from torchtitan.rl.generator.generator import Generator
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.types import EngineRequest, SamplingConfig
-from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig
+from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig, VLLMProfilerConfig
 from torchtitan.rl.generator.vllm.engine import (
     _build_sampling_params,
     _extract_request_metrics_inputs,
@@ -691,6 +691,7 @@ def test_extra_engine_args_reach_engine_args(monkeypatch, tmp_path):
             r"use Generator\.Config\.max_num_batched_tokens",
         ),
         ("seed", r"use Generator\.Config\.debug\.seed"),
+        ("profiler_config", r"use VLLMEngine\.Config\.profiler"),
     ],
 )
 def test_extra_engine_args_rejects_torchtitan_owned_keys(key, match):
@@ -698,6 +699,45 @@ def test_extra_engine_args_rejects_torchtitan_owned_keys(key, match):
     with pytest.raises(ValueError, match=match):
         add_extra_vllm_engine_args(engine_kwargs, {key: 1})
     assert engine_kwargs == {"scheduling_policy": "fcfs"}
+
+
+def test_profiler_traces_each_generator_under_the_dump_folder(monkeypatch, tmp_path):
+    """The trace directory follows the run's dump folder, which a launch can override."""
+    default_kwargs = _build_engine_kwargs(
+        monkeypatch, tmp_path, Generator.Config(model=_MODEL_CONFIG)
+    )
+    assert "profiler_config" not in default_kwargs
+
+    profiler_config = _build_engine_kwargs(
+        monkeypatch,
+        tmp_path,
+        Generator.Config(
+            model=_MODEL_CONFIG,
+            engine=VLLMEngine.Config(profiler=VLLMProfilerConfig(max_iterations=64)),
+        ),
+    )["profiler_config"]
+    assert profiler_config.torch_profiler_dir == str(
+        tmp_path / "profiling" / "generator" / "generator"
+    )
+    assert (profiler_config.profiler, profiler_config.max_iterations) == ("torch", 64)
+
+
+@pytest.mark.parametrize("rank, num_starts", [(0, 1), (1, 0)])
+def test_generator_starts_the_engine_profiler_at_its_start_step(rank, num_starts):
+    """Rank 0 starts the profile once; the engine loop starts it on every rank."""
+    generator = Generator.__new__(Generator)
+    generator._rank = rank
+    generator._profile_start_step = VLLMEngine.Config(
+        profiler=VLLMProfilerConfig(start_step=3)
+    ).profile_start_step
+    generator._engine_loop = Mock()
+
+    async def main():
+        for step in range(1, 6):
+            await generator.sync_log_step(step)
+
+    asyncio.run(main())
+    assert generator._engine_loop.start_profile.call_count == num_starts
 
 
 # --- CUDA graph config (VLLMCudaGraphConfig.get_vllm_compilation_config) ---

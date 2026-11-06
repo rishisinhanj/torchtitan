@@ -36,7 +36,7 @@ from torchtitan.rl.generator.types import (
 from torchtitan.rl.generator.vllm.batch_invariance import (
     force_logprobs_fn_for_batch_invariance,
 )
-from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig
+from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig, VLLMProfilerConfig
 from torchtitan.rl.generator.vllm.registry import (
     register_to_vllm,
     TORCHTITAN_CONFIG_FORMAT,
@@ -67,6 +67,7 @@ def add_extra_vllm_engine_args(
         "max_num_batched_tokens": "Generator.Config.max_num_batched_tokens",
         "compilation_config": "VLLMEngine.Config.cuda_graph",
         "seed": "Generator.Config.debug.seed",
+        "profiler_config": "VLLMEngine.Config.profiler",
     }
     owned_keys = sorted(
         extra_engine_args.keys()
@@ -112,6 +113,15 @@ class VLLMEngine(GenerationEngine):
         session_kv_holder: VLLMSessionKVHolder.Config | None = None
         """Keep each multi-turn session's cached prefix on GPU between its turns (see
         `VLLMSessionKVHolder`). None: off."""
+
+        profiler: VLLMProfilerConfig | None = None
+        """Trace every engine rank over a window of engine steps that starts with a
+        training step (see `VLLMProfilerConfig`). A window still open when the
+        generator shuts down writes no trace. None: off."""
+
+        @property
+        def profile_start_step(self) -> int | None:
+            return None if self.profiler is None else self.profiler.start_step
 
     def __init__(
         self,
@@ -163,6 +173,9 @@ class VLLMEngine(GenerationEngine):
             gpu_memory_limit=gpu_memory_limit,
             max_num_batched_tokens=max_num_batched_tokens,
             seed=debug.seed,
+            profiler_dir=os.path.join(
+                output_dir, "profiling", "generator", generator_name
+            ),
         )
         tp_degree = parallelism.tensor_parallel_degree
         stat_loggers = None
@@ -226,8 +239,10 @@ class VLLMEngine(GenerationEngine):
         gpu_memory_limit: float,
         max_num_batched_tokens: int | None,
         seed: int | None,
+        profiler_dir: str,
     ) -> EngineArgs:
-        """Build the vLLM ``EngineArgs`` (see ``GenerationEngine`` for the arguments)."""
+        """Build the vLLM ``EngineArgs`` (see ``GenerationEngine`` for the arguments;
+        ``profiler_dir`` is where ``Config.profiler`` writes this generator's traces)."""
         enable_ep = parallelism.expert_parallel_degree > 1
         engine_kwargs = dict(
             # ``model`` is the path to the HF checkpoint directory. The
@@ -300,6 +315,11 @@ class VLLMEngine(GenerationEngine):
             engine_kwargs["compilation_config"] = vllm_compilation_config
         if seed is not None:
             engine_kwargs["seed"] = seed
+        profiler = self.config.profiler
+        if profiler is not None:
+            engine_kwargs["profiler_config"] = profiler.get_vllm_profiler_config(
+                torch_profiler_dir=profiler_dir
+            )
         add_extra_vllm_engine_args(engine_kwargs, self.config.extra_engine_args)
         return EngineArgs(**engine_kwargs)
 
@@ -401,6 +421,11 @@ class VLLMEngine(GenerationEngine):
     def release_sessions(self, session_ids: list[str], group_ids: list[int]) -> None:
         if self._session_kv_holder is not None:
             self._session_kv_holder.release(session_ids, group_ids)
+
+    def start_profile(self) -> None:
+        """Start vLLM's profiler on this rank; it stops itself, and writes the trace, after
+        ``Config.profiler.max_iterations`` engine steps."""
+        self._engine.start_profile()
 
     def log_stats(self, step: int) -> None:
         if self._session_kv_holder is not None:

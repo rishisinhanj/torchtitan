@@ -224,6 +224,7 @@ class Generator(Configurable):
         sl.log_trace_instant("structured_logger_started")
 
         self.config = config
+        self._profile_start_step = config.engine.profile_start_step
 
         self._rank = rank if rank is not None else int(os.environ.get("RANK", "0"))
         dp_degree = config.parallelism.data_parallel_degree
@@ -347,9 +348,12 @@ class Generator(Configurable):
         return self._engine_loop.policy_version
 
     async def sync_log_step(self, step: int, relative_step: int | None = None) -> None:
-        """Sync the structured-logger step counter from the controller."""
+        """Sync the structured-logger step counter from the controller, and start the
+        engine's profiler at its start step (``GenerationEngine.Config.profile_start_step``)."""
         sl.set_step(step, relative_step=relative_step)
         self._engine_loop.log_engine_stats(step)
+        if self._rank == 0 and step == self._profile_start_step:
+            self._engine_loop.start_profile()
 
     async def start_engine_loop(self) -> None:
         """Start the background engine loop on every rank (one-time, idempotent)."""

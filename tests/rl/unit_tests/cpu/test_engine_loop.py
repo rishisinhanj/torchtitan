@@ -794,6 +794,27 @@ def test_actor_loop_takes_calls_while_the_engine_steps(engine_thread) -> None:
     asyncio.run(run())
 
 
+def test_profile_starts_on_the_engine_thread_before_the_next_step(
+    engine_thread,
+) -> None:
+    calls: list[tuple[str, threading.Thread]] = []
+    engine = _FakeEngine(lambda: calls.append(("step", threading.current_thread())))
+    engine.start_profile = lambda: calls.append(
+        ("start_profile", threading.current_thread())
+    )
+
+    async def run() -> None:
+        engine_loop = engine_thread(engine)
+        engine_loop.start()
+        engine_loop.start_profile()
+        await asyncio.wait_for(_generate(engine_loop, "r0"), _TIMEOUT_S)
+        await asyncio.wait_for(engine_loop.close(), _TIMEOUT_S)
+        thread = engine_loop.engine_thread.thread
+        assert calls == [("start_profile", thread), ("step", thread)]
+
+    asyncio.run(run())
+
+
 def test_load_runs_on_the_engine_thread(engine_thread, monkeypatch) -> None:
     # Monarch finds the calling actor through a ContextVar, so the engine loop's work must
     # see the context of the endpoint that started it.

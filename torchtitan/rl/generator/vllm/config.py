@@ -13,7 +13,7 @@ import math
 from dataclasses import dataclass
 from typing import Literal
 
-from vllm.config import CompilationConfig
+from vllm.config import CompilationConfig, ProfilerConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode, PassConfig
 
 logger = logging.getLogger(__name__)
@@ -166,4 +166,42 @@ class VLLMCudaGraphConfig:
                 enable_sp=enable_sequence_parallel,
                 sp_min_token_num=1 if enable_sequence_parallel else None,
             ),
+        )
+
+
+@dataclass(kw_only=True, slots=True)
+class VLLMProfilerConfig:
+    """Torch profiler trace (CPU ops and GPU kernels) of every vLLM engine rank over a
+    window of engine steps that starts with a training step.
+
+    Each rank writes a ``.pt.trace.json.gz`` trace and a kernel time table
+    (``profiler_out_<local rank>.txt``) under ``<dump_folder>/profiling/generator/<generator>/``.
+    """
+
+    start_step: int = 8
+    """Training step whose start starts the window. The default is the step a trainer
+    ``Profiler.Config(profile_freq=8)`` traces."""
+
+    max_iterations: int = 256
+    """Engine steps the window records. The trace's size, and the engine stall that
+    writes it when the window closes, grow with it."""
+
+    def __post_init__(self) -> None:
+        if self.start_step < 1:
+            raise ValueError(f"start_step must be >= 1, got {self.start_step}")
+        if self.max_iterations < 1:
+            raise ValueError(f"max_iterations must be >= 1, got {self.max_iterations}")
+
+    def get_vllm_profiler_config(self, *, torch_profiler_dir: str) -> ProfilerConfig:
+        """Build vLLM's ``ProfilerConfig``, with tensor shapes and without Python stacks,
+        as the trainer's profiler records them."""
+        return ProfilerConfig(
+            profiler="torch",
+            torch_profiler_dir=torch_profiler_dir,
+            torch_profiler_with_stack=False,
+            torch_profiler_record_shapes=True,
+            # LLMEngine has no frontend to profile; this keeps vLLM from warning that
+            # frontend profiling ignores max_iterations.
+            ignore_frontend=True,
+            max_iterations=self.max_iterations,
         )

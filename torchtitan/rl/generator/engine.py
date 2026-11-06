@@ -61,7 +61,11 @@ class GenerationEngine(Configurable, abc.ABC):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        pass
+        @property
+        def profile_start_step(self) -> int | None:
+            """Training step whose start starts the engine's profiler (see
+            ``start_profile``); None: the engine profiles nothing."""
+            return None
 
     @property
     @abc.abstractmethod
@@ -118,6 +122,10 @@ class GenerationEngine(Configurable, abc.ABC):
 
     def log_stats(self, step: int) -> None:
         """Log the engine's own per-step stats, if any."""
+
+    def start_profile(self) -> None:
+        """Start the profiler of an engine whose ``Config.profile_start_step`` is set."""
+        raise NotImplementedError(f"{type(self).__name__} has no profiler")
 
     @abc.abstractmethod
     def shutdown(self) -> None:

@@ -278,6 +278,10 @@ the output directory.
 
 The trainer supports the core `Profiler.Config`, including Kineto traces and
 memory snapshots. Configure it under `config.trainer.profiler` in the recipe.
+For the generators, `config.generator.engine.profiler = VLLMProfilerConfig()`
+records a torch profiler trace of every vLLM engine rank for `max_iterations`
+engine steps from the start of training step `start_step`, under
+`<dump_folder>/profiling/generator/<generator>/`.
 
 ## Monarch specifics
 

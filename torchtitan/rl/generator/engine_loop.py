@@ -234,6 +234,11 @@ class EngineLoop:
         if engine is not None and self._rank == 0:
             engine.log_stats(step)
 
+    def start_profile(self) -> None:
+        """RANK 0: start the engine's profiler on every rank, before the same engine step."""
+        self._rank0_check_running("start_profile")
+        self._queue.put(ProfileStartMessage())
+
     async def close(self) -> None:
         """Stop the loop, which releases the dispatcher and the engine on exit.
 
@@ -340,6 +345,8 @@ class EngineLoop:
                 self._engine.release_sessions(
                     decision.released_session_ids, decision.released_group_ids
                 )
+                if decision.start_profile:
+                    self._engine.start_profile()
 
                 if decision.action is LoopAction.LOAD_MODEL_STATE_DICT:
                     await self._load_model_state_dict(decision.load_version)
@@ -402,7 +409,12 @@ class EngineLoop:
             message = self._queue.get_nowait()
             if isinstance(
                 message,
-                (CloseMessage, ResultDrainFailureMessage, SessionReleaseMessage),
+                (
+                    CloseMessage,
+                    ResultDrainFailureMessage,
+                    SessionReleaseMessage,
+                    ProfileStartMessage,
+                ),
             ):
                 continue
             if message.reply.set_running_or_notify_cancel():
@@ -448,6 +460,7 @@ class EngineLoop:
 
         released_session_ids: list[str] = []
         released_group_ids: list[int] = []
+        start_profile = False
         for message in messages:
             if isinstance(message, ResultDrainFailureMessage):
                 # Peers are already waiting in the decision broadcast. Send them
@@ -460,6 +473,9 @@ class EngineLoop:
             if isinstance(message, SessionReleaseMessage):
                 released_session_ids.extend(message.session_ids)
                 released_group_ids.extend(message.group_ids)
+                continue
+            if isinstance(message, ProfileStartMessage):
+                start_profile = True
                 continue
             # Skip a call its caller already cancelled; once running, the reply ignores cancellation, so only
             # the loop resolves it.
@@ -506,6 +522,7 @@ class EngineLoop:
             )
         decision.released_session_ids = released_session_ids
         decision.released_group_ids = released_group_ids
+        decision.start_profile = start_profile
         return decision
 
     @sl.log_trace_span("load_model_state_dict_copy")
@@ -598,6 +615,11 @@ class SessionReleaseMessage:
 
 
 @dataclass(kw_only=True, slots=True)
+class ProfileStartMessage:
+    """Starts the engine's profiler on every rank; no reply."""
+
+
+@dataclass(kw_only=True, slots=True)
 class ResultDrainFailureMessage:
     """A failure from the rank-0 peer-result drain task."""
 
@@ -609,6 +631,7 @@ EngineLoopMessage = (
     | ModelStateDictLoadMessage
     | CloseMessage
     | SessionReleaseMessage
+    | ProfileStartMessage
     | ResultDrainFailureMessage
 )
 
@@ -696,3 +719,6 @@ class LoopDecision:
     released_session_ids: list[str] = field(default_factory=list)
     released_group_ids: list[int] = field(default_factory=list)
     # sessions (and groups) whose held KV every rank releases before acting (session_kv_holder)
+
+    start_profile: bool = False
+    # every rank starts the engine's profiler before acting
