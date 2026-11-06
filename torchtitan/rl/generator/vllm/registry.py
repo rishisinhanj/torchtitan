@@ -30,6 +30,8 @@ import logging
 import os
 from typing import Any, TYPE_CHECKING
 
+import torch
+
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.config import PrecisionConfig
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
@@ -100,6 +102,10 @@ def vllm_attention_backend(cfg: Decoder.Config) -> AttentionBackendEnum | None:
     if isinstance(kernel_config, FlexInnerAttention.Config):
         return AttentionBackendEnum.FLEX_ATTENTION
     if isinstance(kernel_config, VarlenInnerAttention.Config):
+        # ROCm's torch varlen kernel rejects the paged KV cache (block_table) that
+        # the CUSTOM backend passes it.
+        if torch.version.hip is not None:
+            return AttentionBackendEnum.ROCM_ATTN
         return AttentionBackendEnum.CUSTOM
     raise ValueError(
         "Only varlen and flex attention backends, or MLA with a compressed "
