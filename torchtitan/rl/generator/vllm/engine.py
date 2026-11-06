@@ -307,6 +307,11 @@ class VLLMEngine(GenerationEngine):
         # otherwise does not split the context across workgroups.
         if torch.version.hip is None and not has_cuda_capability(9, 0):
             engine_kwargs["block_size"] = 256
+        # On ROCm, torch._grouped_mm (MoE experts) runs one GEMM per expert after copying the group offsets to
+        # the host, which also rules out graph capture, unless its CK-tile grouped GEMM is enabled. torch reads
+        # the flag at every call, and the vLLM worker runs in this process (external_launcher).
+        if torch.version.hip is not None:
+            os.environ.setdefault("ROCM_ALLOW_GROUP_GEMM_CK_TILE", "1")
         vllm_compilation_config = self.config.cuda_graph.get_vllm_compilation_config(
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
