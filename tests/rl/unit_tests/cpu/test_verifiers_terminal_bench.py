@@ -457,6 +457,46 @@ def test_recipe_layouts_fit_the_model(
 @pytest.mark.parametrize(
     "name",
     [
+        f"rl_grpo_qwen3_{model}_base_tb_{arm}"
+        for model in ("8b", "30b_a3b")
+        for arm in ("shakedown", "mt", "st")
+    ],
+)
+def test_trace_recipe_layouts_fit_one_8_gpu_host(name: str) -> None:
+    """Trainer and generators share one 8-GPU host, within the model's shape."""
+    config = ConfigLoader().load(
+        [
+            "--module",
+            "torchtitan_recipes.rl.verifiers_terminal_bench_trace",
+            "--config",
+            name,
+        ]
+    )
+    trainer = config.trainer.parallelism
+    generator = config.generator.parallelism
+    num_kv_heads = _num_kv_heads(config.generator.model)
+    num_experts = _num_experts(config.generator.model)
+
+    assert (
+        trainer.data_parallel_replicate_degree
+        * trainer.data_parallel_shard_degree
+        * trainer.tensor_parallel_degree
+        * trainer.context_parallel_degree
+        + config.num_generators
+        * generator.data_parallel_degree
+        * generator.tensor_parallel_degree
+        == 8
+    )
+    assert num_kv_heads % trainer.tensor_parallel_degree == 0
+    assert num_kv_heads % generator.tensor_parallel_degree == 0
+    if num_experts is not None:
+        assert num_experts % trainer.expert_parallel_degree == 0
+        assert num_experts % generator.expert_parallel_degree == 0
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
         "rl_grpo_qwen35_9b_terminal_bench",
         "rl_grpo_qwen35_35b_a3b_terminal_bench",
     ],
