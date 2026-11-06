@@ -421,6 +421,52 @@ class TestFold:
         }
 
 
+class TestComputeRolloutMetrics:
+    def test_reports_rollout_timing_from_logs(self) -> None:
+        """Timing keys in `Rollout.logs` become `rollout/timing/*`; a rollout whose
+        rollouter sets none (the last one) counts toward no timing metric."""
+        logs = [
+            {"total_sec": 10.0, "model_sec": 4.0, "unaccounted_sec": -0.5, "task": "a"},
+            {"total_sec": 30.0, "model_sec": 12.0, "unaccounted_sec": 2.5, "task": "b"},
+            {},
+        ]
+        rollouts = [
+            Rollout(
+                group_id=0,
+                rollout_id=rollout_id,
+                status=RolloutStatus.COMPLETED,
+                turns=[
+                    RolloutTurn(
+                        rollout_id=RolloutTurnID(
+                            group_id=0, rollout_id=rollout_id, turn_id=0
+                        ),
+                        prompt_prefix_len=0,
+                        prompt_delta_token_ids=np.array([1], dtype=np.int32),
+                        completion_token_ids=np.array([2], dtype=np.int32),
+                        completion_logprobs=np.array([-0.1], dtype=np.float32),
+                    )
+                ],
+                logs=rollout_logs,
+            )
+            for rollout_id, rollout_logs in enumerate(logs)
+        ]
+        aggregated = m.MetricsProcessor._aggregate_metrics(
+            compute_rollout_metrics("rollout", rollouts)
+        )
+        assert {
+            key: value
+            for key, value in aggregated.items()
+            if key.startswith("rollout/timing/")
+        } == {
+            "rollout/timing/model_sec/mean": 8.0,
+            "rollout/timing/model_sec/max": 12.0,
+            "rollout/timing/total_sec/mean": 20.0,
+            "rollout/timing/total_sec/max": 30.0,
+            "rollout/timing/unaccounted_sec/mean": 1.0,
+            "rollout/timing/unaccounted_sec/max": 2.5,
+        }
+
+
 # ---------------------------------------------------------------------------
 # log_to_console (stateless utility)
 # ---------------------------------------------------------------------------

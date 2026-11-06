@@ -492,10 +492,12 @@ def test_verifiers_rollout_logs_keep_the_failure_reason(caplog) -> None:
             )
         ],
         timing=SimpleNamespace(
+            boot=span(20.0),
             setup=span(5.0),
             agent=SimpleNamespace(
                 duration=7200.0, model=span(6900.0), harness=span(300.0)
             ),
+            finalize=span(1.0),
             scoring=span(0.0),
         ),
         calls=[
@@ -505,7 +507,7 @@ def test_verifiers_rollout_logs_keep_the_failure_reason(caplog) -> None:
             ),
         ],
     )
-    logs = verifiers_rollout_logs(SimpleNamespace(errors=[]), trace)
+    logs = verifiers_rollout_logs(SimpleNamespace(errors=[]), trace, total_sec=7300.0)
 
     assert logs["errors"] == [
         {
@@ -520,6 +522,13 @@ def test_verifiers_rollout_logs_keep_the_failure_reason(caplog) -> None:
         6900.0,
         300.0,
     )
+    assert (logs["boot_sec"], logs["finalize_sec"], logs["total_sec"]) == (
+        20.0,
+        1.0,
+        7300.0,
+    )
+    # 7300 s minus boot, setup, agent, finalize and scoring.
+    assert logs["unaccounted_sec"] == 74.0
     assert logs["model_calls"] == 2
     assert logs["failed_model_calls"] == 1
     assert logs["slowest_model_call_sec"] == 1801.0
@@ -825,8 +834,10 @@ def test_rollout_whose_first_prompt_does_not_fit_is_flagged(caplog) -> None:
         stop_condition="agent_completed",
         errors=[],
         timing=SimpleNamespace(
+            boot=span,
             setup=span,
             agent=SimpleNamespace(duration=0.0, model=span, harness=span),
+            finalize=span,
             scoring=span,
         ),
         calls=[
@@ -912,8 +923,10 @@ def test_timed_out_rollout_is_logged_and_keeps_no_reward(caplog) -> None:
         reward=1.0,
         errors=[],
         timing=SimpleNamespace(
+            boot=span,
             setup=span,
             agent=SimpleNamespace(duration=0.0, model=span, harness=span),
+            finalize=span,
             scoring=span,
         ),
         calls=[],
@@ -971,8 +984,10 @@ def test_rollout_releases_every_trace_session_even_if_one_release_fails(caplog) 
             stop_condition=None,
             errors=[],
             timing=SimpleNamespace(
+                boot=span,
                 setup=span,
                 agent=SimpleNamespace(duration=0.0, model=span, harness=span),
+                finalize=span,
                 scoring=span,
             ),
             calls=[],

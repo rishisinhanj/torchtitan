@@ -19,6 +19,23 @@ from torchtitan.rl.rollout.types import Rollout
 
 logger = logging.getLogger(__name__)
 
+# Numeric `Rollout.logs` keys that `compute_rollout_metrics` reports as
+# `{prefix}/timing/<key>` (Mean and Max), e.g. the Verifiers rollouter's phases.
+_ROLLOUT_TIMING_LOG_KEYS = (
+    "boot_sec",
+    "setup_sec",
+    "agent_sec",
+    "model_sec",
+    "harness_sec",
+    "finalize_sec",
+    "scoring_sec",
+    "total_sec",
+    "unaccounted_sec",
+    "model_calls",
+    "failed_model_calls",
+    "slowest_model_call_sec",
+)
+
 
 class MetricsTimer:
     """Times named code spans; flush() drains them into Mean metrics, then resets.
@@ -236,8 +253,9 @@ def compute_policy_age_metrics(
 
 
 def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metric]:
-    """Build rollout-derived metrics: lengths, truncation, reward breakdown, and each turn's
-    per-generation metrics (the latter keep their own generator-side keys, unprefixed).
+    """Build rollout-derived metrics: lengths, truncation, reward breakdown, the timing a
+    rollouter reports in `Rollout.logs`, and each turn's per-generation metrics (the latter
+    keep their own generator-side keys, unprefixed).
 
     Args:
         prefix: Metric namespace (e.g. `"rollout"` or `"validation"`).
@@ -288,6 +306,13 @@ def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metr
         m.Metric(f"{prefix}_reward/component/{name}", m.Mean.from_list(values))
         for name, values in sorted(values_by_name.items())
     )
+
+    # Rollout timing; a key that no rollout's logs set emits nothing.
+    for key in _ROLLOUT_TIMING_LOG_KEYS:
+        values = [rollout.logs[key] for rollout in rollouts if key in rollout.logs]
+        if values:
+            out.append(m.Metric(f"{prefix}/timing/{key}", m.Mean.from_list(values)))
+            out.append(m.Metric(f"{prefix}/timing/{key}", m.Max.from_list(values)))
 
     # Per-generation turn metrics (latencies, output tokens) measured by the generator.
     # They carry their own keys (e.g. "generator/..."), so they ride through unprefixed.

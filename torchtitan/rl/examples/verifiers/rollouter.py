@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field, replace
 from typing import Any, TYPE_CHECKING
 
@@ -306,6 +307,7 @@ class VerifiersRollouter(Rollouter):
         ):
             raise RuntimeError("Verifiers rollouter is not initialized")
 
+        start = time.perf_counter()
         # One VerifiersEnvClient.run executes a complete rollout. The harness
         # owns the multi-turn model/tool loop and calls the generation server once per
         # generation; run returns only after the rollout stops.
@@ -379,7 +381,9 @@ class VerifiersRollouter(Rollouter):
                     "" if task is None else f" of task {task}",
                 )
             status = RolloutStatus.ERROR
-        logs = verifiers_rollout_logs(verifiers_episode, trace)
+        logs = verifiers_rollout_logs(
+            verifiers_episode, trace, total_sec=time.perf_counter() - start
+        )
         if status.is_error():
             log_failed_rollout(logs, group_id=group_id, rollout_id=rollout_id)
         else:
@@ -517,7 +521,9 @@ def _local_taskset_module(taskset: VerifiersTasksetConfig) -> str | None:
     return module if taskset.id == alias else None
 
 
-def verifiers_rollout_logs(verifiers_episode: Any, trace: Any) -> dict[str, Any]:
+def verifiers_rollout_logs(
+    verifiers_episode: Any, trace: Any, *, total_sec: float
+) -> dict[str, Any]:
     """Summarize how a Verifiers rollout ended, for ``Rollout.logs``.
 
     Verifiers' own "rollout done" line prints only the error type or stop
@@ -526,8 +532,15 @@ def verifiers_rollout_logs(verifiers_episode: Any, trace: Any) -> dict[str, Any]
     latency. For example, ``agent_sec=7200 model_sec=6900
     slowest_model_call_sec=1801`` on an agent timeout points at slow generation,
     not the task.
+
+    ``total_sec`` is the rollouter's wall time for the rollout, from sending the
+    task through releasing its routing sessions and converting its trace.
+    ``unaccounted_sec`` is the part of it outside Verifiers' five phases (boot,
+    setup, agent, finalize, scoring), e.g. env-server queueing, runtime teardown
+    and transport. It is not clamped at 0.
     """
     timing = trace.timing
+    phases = (timing.boot, timing.setup, timing.agent, timing.finalize, timing.scoring)
     call_seconds = [call.time.duration for call in trace.calls]
     return {
         "verifiers_trace_id": trace.id,
@@ -537,11 +550,15 @@ def verifiers_rollout_logs(verifiers_episode: Any, trace: Any) -> dict[str, Any]
             error.model_dump(mode="json")
             for error in (*verifiers_episode.errors, *trace.errors)
         ],
+        "boot_sec": timing.boot.duration,
         "setup_sec": timing.setup.duration,
         "agent_sec": timing.agent.duration,
         "model_sec": timing.agent.model.duration,
         "harness_sec": timing.agent.harness.duration,
+        "finalize_sec": timing.finalize.duration,
         "scoring_sec": timing.scoring.duration,
+        "total_sec": total_sec,
+        "unaccounted_sec": total_sec - sum(phase.duration for phase in phases),
         "model_calls": len(call_seconds),
         "failed_model_calls": sum(call.error is not None for call in trace.calls),
         "slowest_model_call_sec": max(call_seconds, default=0.0),
