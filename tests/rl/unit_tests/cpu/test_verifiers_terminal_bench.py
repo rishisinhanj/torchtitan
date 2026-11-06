@@ -431,8 +431,8 @@ def test_recipe_layouts_fit_the_model(
 @pytest.mark.parametrize(
     "name",
     [
-        f"rl_grpo_qwen3_{model}_base_tb_{arm}"
-        for model in ("8b", "30b_a3b")
+        f"rl_grpo_qwen3_{model}_tb_{arm}"
+        for model in ("8b_base", "30b_a3b_base", "30b_a3b_base_ep1")
         for arm in ("shakedown", "mt", "st")
     ],
 )

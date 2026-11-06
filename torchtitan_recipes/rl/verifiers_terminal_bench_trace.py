@@ -17,6 +17,10 @@ three arms:
   steps from the start of step 8.
 - ``st``: ``mt`` with one agent turn, the single-turn control.
 
+Qwen3-30B-A3B-Base also runs every arm with four one-GPU generators (``ep1``)
+instead of one expert-parallel generator, whose all-to-all decode step took
+about 150 ms per token.
+
 Base models score about 0 on these tasks, so zero-variance reward groups are
 trained on instead of dropped; dropping them ends a run after 10 untrainable
 batches.
@@ -279,6 +283,34 @@ def _qwen3_30b_a3b_base(arm: _Arm, *, name: str) -> Controller.Config:
     return config
 
 
+def _qwen3_30b_a3b_base_ep1(arm: _Arm, *, name: str) -> Controller.Config:
+    """Qwen3-30B-A3B-Base: the trainer of ``_qwen3_30b_a3b_base`` and four one-GPU
+    generators (TP=1, EP=1).
+
+    Without expert parallelism a decode step has no all-to-all, no split sizes
+    copied to the host and no TP all-reduce. It still runs eagerly: on ROCm,
+    ``torch._grouped_mm`` copies its group offsets to the host, which CUDA graph
+    capture does not allow.
+    """
+    config = _qwen3_base_terminal_bench_trace(
+        "30B-A3B",
+        arm=arm,
+        hf_assets_path=f"{_MODELS_DIR}/Qwen3-30B-A3B-Base",
+        dump_folder=f"{_RUNS_DIR}/{name}",
+        trainer_parallelism=ParallelismConfig(
+            data_parallel_replicate_degree=1,
+            data_parallel_shard_degree=2,
+            tensor_parallel_degree=2,
+            expert_parallel_degree=4,
+        ),
+        generator_parallelism=InferenceParallelismConfig(),
+        num_generators=4,
+        generator_cuda_graph_mode="NONE",
+    )
+    config.generator.gpu_memory_limit = 0.8
+    return config
+
+
 def rl_grpo_qwen3_8b_base_tb_shakedown() -> Controller.Config:
     """Qwen3-8B-Base shakedown: 3 steps, 2 samples per prompt, 4 agent turns."""
     return _qwen3_8b_base("shakedown", name="rl_grpo_qwen3_8b_base_tb_shakedown")
@@ -309,3 +341,20 @@ def rl_grpo_qwen3_30b_a3b_base_tb_mt() -> Controller.Config:
 def rl_grpo_qwen3_30b_a3b_base_tb_st() -> Controller.Config:
     """Qwen3-30B-A3B-Base single-turn control: the multi-turn trace with one agent turn."""
     return _qwen3_30b_a3b_base("st", name="rl_grpo_qwen3_30b_a3b_base_tb_st")
+
+
+def rl_grpo_qwen3_30b_a3b_base_ep1_tb_shakedown() -> Controller.Config:
+    """Qwen3-30B-A3B-Base shakedown on four one-GPU generators."""
+    return _qwen3_30b_a3b_base_ep1(
+        "shakedown", name="rl_grpo_qwen3_30b_a3b_base_ep1_tb_shakedown"
+    )
+
+
+def rl_grpo_qwen3_30b_a3b_base_ep1_tb_mt() -> Controller.Config:
+    """Qwen3-30B-A3B-Base multi-turn trace on four one-GPU generators."""
+    return _qwen3_30b_a3b_base_ep1("mt", name="rl_grpo_qwen3_30b_a3b_base_ep1_tb_mt")
+
+
+def rl_grpo_qwen3_30b_a3b_base_ep1_tb_st() -> Controller.Config:
+    """Qwen3-30B-A3B-Base single-turn control on four one-GPU generators."""
+    return _qwen3_30b_a3b_base_ep1("st", name="rl_grpo_qwen3_30b_a3b_base_ep1_tb_st")
