@@ -636,5 +636,7 @@ def _extract_request_metrics_inputs(
         last_token_ts=stats.last_token_ts,
         first_token_latency=stats.first_token_latency,
         num_generation_tokens=stats.num_generation_tokens,
-        num_preemptions=stats.num_preemptions,
+        # TODO: read stats.num_preemptions directly once ROCm images ship a vLLM
+        # newer than 0.29, whose RequestStateStats has no num_preemptions.
+        num_preemptions=getattr(stats, "num_preemptions", 0),
     )
