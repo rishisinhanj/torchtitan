@@ -20,6 +20,7 @@ from torchtitan.models.common.attention.gdn import GDN
 from torchtitan.models.common.attention.kda import KDA
 from torchtitan.models.deepseek_v3 import build_model_config as build_dsv3_config
 from torchtitan.models.kimi_k3 import build_model_config as build_kimi_k3_config
+from torchtitan.models.qwen3 import build_model_config as build_qwen3_config
 from torchtitan.models.qwen3_5 import build_model_config
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.vllm import registry
@@ -225,6 +226,26 @@ def test_batch_invariant_kda_registers_attention_gym_replay_state(monkeypatch):
         temporal_copy,
         *(temporal_copy for _ in range(6)),
     )
+
+
+@pytest.mark.parametrize(
+    ("attn_backend", "hip_version", "expected"),
+    [
+        ("varlen", None, "CUSTOM"),
+        ("varlen", "7.2.0", "ROCM_ATTN"),
+        ("flex", "7.2.0", "FLEX_ATTENTION"),
+    ],
+)
+def test_varlen_attention_uses_vllm_rocm_backend_on_rocm(
+    monkeypatch, attn_backend, hip_version, expected
+):
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    monkeypatch.setattr(torch.version, "hip", hip_version)
+    config = build_qwen3_config(
+        "debugmodel", parallelism=ParallelismConfig(), attn_backend=attn_backend
+    )
+    assert registry.vllm_attention_backend(config) is AttentionBackendEnum[expected]
 
 
 @pytest.mark.parametrize(
