@@ -291,6 +291,9 @@ def _qwen3_30b_a3b_base_ep1(arm: _Arm, *, name: str) -> Controller.Config:
     copied to the host and no TP all-reduce. It still runs eagerly: on ROCm,
     ``torch._grouped_mm`` copies its group offsets to the host, which CUDA graph
     capture does not allow.
+
+    An eager decode step records ~150K CPU ops in the generator profiler, so its window
+    is 64 engine steps (~200 MB of gzipped trace per generator) instead of 256.
     """
     config = _qwen3_base_terminal_bench_trace(
         "30B-A3B",
@@ -308,6 +311,8 @@ def _qwen3_30b_a3b_base_ep1(arm: _Arm, *, name: str) -> Controller.Config:
         generator_cuda_graph_mode="NONE",
     )
     config.generator.gpu_memory_limit = 0.8
+    if config.generator.engine.profiler is not None:
+        config.generator.engine.profiler = VLLMProfilerConfig(max_iterations=64)
     return config
 
 

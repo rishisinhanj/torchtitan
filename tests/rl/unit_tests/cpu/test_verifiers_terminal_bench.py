@@ -468,6 +468,30 @@ def test_trace_recipe_layouts_fit_one_8_gpu_host(name: str) -> None:
         assert num_experts % generator.expert_parallel_degree == 0
 
 
+@pytest.mark.parametrize("arm", ["mt", "st"])
+@pytest.mark.parametrize("model", ["8b_base", "30b_a3b_base", "30b_a3b_base_ep1"])
+def test_trace_arms_profile_the_same_step_in_trainer_and_generators(
+    model: str, arm: str
+) -> None:
+    """The trainer traces step 8 and every generator's window starts with it."""
+    config = ConfigLoader().load(
+        [
+            "--module",
+            "torchtitan_recipes.rl.verifiers_terminal_bench_trace",
+            "--config",
+            f"rl_grpo_qwen3_{model}_tb_{arm}",
+        ]
+    )
+    trainer_profiler = config.trainer.profiler
+    generator_profiler = config.generator.engine.profiler
+
+    assert trainer_profiler.enable_profiling
+    assert trainer_profiler.profile_freq == 8
+    assert generator_profiler.start_step == 8
+    # An eager MoE decode step records ~150K CPU ops; graphs record a few hundred.
+    assert generator_profiler.max_iterations == (64 if model == "30b_a3b_base_ep1" else 256)
+
+
 @pytest.mark.parametrize(
     "name",
     [
