@@ -37,6 +37,16 @@ from verifiers.v1.trace import Trace
 
 PROGRAM_SOURCE = (Path(__file__).resolve().parent / "terminus_harness.py").read_text()
 
+_UBUNTU_HOSTS = r"https?://(([a-z]{2}\.)?archive|security)\.ubuntu\.com/ubuntu/?"
+# Rewrites one-line (.list) and deb822 (.sources) apt sources. Images without
+# Ubuntu's hosts, or whose agent user cannot write the files, are left as they are.
+_USE_UBUNTU_MIRROR = (
+    "for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list"
+    " /etc/apt/sources.list.d/*.sources; do"
+    f' [ -w "$f" ] && sed -i -E "s#{_UBUNTU_HOSTS}#$MIRROR#g" "$f";'
+    " done; true"
+)
+
 
 class TerminalBenchTerminusHarnessConfig(HarnessConfig):
     version: str = Field(default="0.21.0", pattern=r"^[A-Za-z0-9._+-]+$")
@@ -58,6 +68,14 @@ class TerminalBenchTerminusHarnessConfig(HarnessConfig):
     which this harness does not pass.
     """
 
+    ubuntu_mirror: str | None = Field(
+        default=None, pattern=r"^https?://[A-Za-z0-9._:/-]+/$"
+    )
+    """Ubuntu archive (e.g. ``http://mirrors.edge.kernel.org/ubuntu/``) that replaces
+    ``archive.ubuntu.com`` and ``security.ubuntu.com`` in the sandbox's apt sources
+    at setup, before Terminus-2 installs tmux with ``apt-get`` (120 s limit).
+    """
+
 
 class TerminalBenchTerminusHarness(Harness[TerminalBenchTerminusHarnessConfig]):
     """Verifiers' Terminus-2 harness, running ``terminus_harness.py``."""
@@ -69,6 +87,10 @@ class TerminalBenchTerminusHarness(Harness[TerminalBenchTerminusHarnessConfig]):
         return PROGRAM_SOURCE.replace("{version}", self.config.version)
 
     async def setup(self, runtime: Runtime) -> None:
+        if self.config.ubuntu_mirror is not None:
+            await runtime.run(
+                ["sh", "-c", _USE_UBUNTU_MIRROR], {"MIRROR": self.config.ubuntu_mirror}
+            )
         await runtime.prepare_uv_script(
             self._program_source(), self.config.resolved_env
         )

@@ -81,6 +81,10 @@ from verifiers.v1.tasksets.harbor import HarborEnvConfig
 from torchtitan_recipes.rl.model_configs import build_rl_model_configs
 
 _ENV_SERVER_WORKERS = 16
+# Ubuntu's own archive and security hosts can be too slow from the cluster for
+# Terminus-2's 120 s tmux install; a rollout whose install fails has no turns,
+# and the batcher drops its whole group.
+_UBUNTU_MIRROR = "http://mirrors.edge.kernel.org/ubuntu/"
 
 
 def _terminal_bench_rollouter_config(
@@ -126,7 +130,9 @@ def _terminal_bench_rollouter_config(
             environment=HarborEnvConfig(
                 agent=vf.AgentConfig(
                     harness=TerminalBenchTerminusHarnessConfig(
-                        id=register_harness_alias(), version="0.22.0"
+                        id=register_harness_alias(),
+                        version="0.22.0",
+                        ubuntu_mirror=_UBUNTU_MIRROR,
                     ),
                     runtime=vf.DockerConfig(),
                     max_turns=max_turns,

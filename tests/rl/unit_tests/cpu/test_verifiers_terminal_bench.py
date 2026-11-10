@@ -7,6 +7,7 @@
 """CPU checks for the Terminal-Bench Verifiers recipe."""
 
 import asyncio
+import os
 import pickle
 import subprocess
 import sys
@@ -214,6 +215,49 @@ def test_tmux_server_outlives_launch_until_cleanup() -> None:
     # The prompts file cleanup removes is the one launch wrote.
     assert '"$TMUX_TMPDIR.prompts.json"' in argv[-1]
     assert list(runtime.files) == ["/tmp/vf-terminus-2-trace.prompts.json"]
+
+
+def test_setup_points_apt_at_the_recipe_mirror(tmp_path) -> None:
+    """Terminus-2 installs tmux with ``apt-get`` under a 120 s limit; setup first
+    moves Ubuntu's archive and security hosts to the recipe's mirror."""
+    harness = load_harness(
+        _rollouter_config(
+            TRAIN_DATASET, EVAL_DATASET
+        ).verifiers_env_server.environment.agent.harness
+    )
+    runtime = _RecordingRuntime()
+    asyncio.run(harness.setup(runtime))
+    [(argv, env)] = runtime.commands
+    assert env == {"MIRROR": "http://mirrors.edge.kernel.org/ubuntu/"}
+
+    (tmp_path / "sources.list.d").mkdir()
+    one_line = tmp_path / "sources.list"
+    one_line.write_text(
+        "deb http://archive.ubuntu.com/ubuntu/ jammy main\n"
+        "deb http://us.archive.ubuntu.com/ubuntu jammy-updates main\n"
+        "deb http://security.ubuntu.com/ubuntu/ jammy-security main\n"
+        "deb http://ppa.launchpad.net/deadsnakes/ppa/ubuntu jammy main\n"
+    )
+    deb822 = tmp_path / "sources.list.d" / "ubuntu.sources"
+    deb822.write_text("URIs: http://archive.ubuntu.com/ubuntu/\nSuites: noble\n")
+    script = argv[-1].replace("/etc/apt", str(tmp_path))
+    subprocess.run([*argv[:-1], script], env={**os.environ, **env}, check=True)
+    assert one_line.read_text() == (
+        "deb http://mirrors.edge.kernel.org/ubuntu/ jammy main\n"
+        "deb http://mirrors.edge.kernel.org/ubuntu/ jammy-updates main\n"
+        "deb http://mirrors.edge.kernel.org/ubuntu/ jammy-security main\n"
+        "deb http://ppa.launchpad.net/deadsnakes/ppa/ubuntu jammy main\n"
+    )
+    assert deb822.read_text() == (
+        "URIs: http://mirrors.edge.kernel.org/ubuntu/\nSuites: noble\n"
+    )
+
+
+def test_setup_leaves_apt_sources_alone_without_a_mirror() -> None:
+    harness = TerminalBenchTerminusHarness(TerminalBenchTerminusHarnessConfig())
+    runtime = _RecordingRuntime()
+    asyncio.run(harness.setup(runtime))
+    assert runtime.commands == []
 
 
 def test_agent_runs_inside_docker_and_verifier_uses_same_taskset() -> None:
