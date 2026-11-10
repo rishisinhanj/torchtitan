@@ -20,7 +20,8 @@ three arms:
 Qwen3-30B-A3B-Base also runs every arm with four one-GPU generators (``ep1``)
 instead of one expert-parallel generator, whose all-to-all decode step took
 about 150 ms per token, and ``mt``/``st`` on them with decode CUDA graphs
-(``ep1_graphs``).
+(``ep1_graphs``). ``ep1_graphs`` has an ``mt50`` too: ``mt`` for 50 steps, whose
+rollout recorder keeps every rollout.
 
 Base models score about 0 on these tasks, so zero-variance reward groups are
 trained on instead of dropped; dropping them ends a run after 10 untrainable
@@ -384,3 +385,17 @@ def rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_st() -> Controller.Config:
     return _qwen3_30b_a3b_base_ep1(
         "st", name="rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_st", cuda_graphs=True
     )
+
+
+def rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt50() -> Controller.Config:
+    """Qwen3-30B-A3B-Base on four one-GPU generators with decode graphs: ``mt`` for 50
+    steps, tracing trainer step 8 only and recording every rollout."""
+    config = _qwen3_30b_a3b_base_ep1(
+        "mt", name="rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt50", cuda_graphs=True
+    )
+    config.async_loop.num_training_steps = 50
+    # Without a repeat limit the trainer profiler traces every 8th step.
+    config.trainer.profiler.profiler_repeat = 1
+    # The filter keeps a group of at most 2k rollouts whole.
+    config.rollout_recorder.filter.k = config.async_loop.num_samples_per_prompt
+    return config

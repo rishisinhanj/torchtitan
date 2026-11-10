@@ -438,6 +438,7 @@ def test_recipe_layouts_fit_the_model(
     + [
         "rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt",
         "rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_st",
+        "rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt50",
     ],
 )
 def test_trace_recipe_layouts_fit_one_8_gpu_host(name: str) -> None:
@@ -499,6 +500,45 @@ def test_trace_arms_profile_the_same_step_in_trainer_and_generators(
     assert generator_profiler.max_iterations == max_iterations.get(model, 256)
     if model == "30b_a3b_base_ep1_graphs":
         assert config.generator.engine.cuda_graph.mode == "FULL_DECODE_ONLY"
+
+
+def test_ep1_graphs_mt50_is_its_mt_arm_for_50_steps_recording_every_rollout() -> None:
+    def load(name: str):
+        return ConfigLoader().load(
+            [
+                "--module",
+                "torchtitan_recipes.rl.verifiers_terminal_bench_trace",
+                "--config",
+                name,
+            ]
+        )
+
+    config = load("rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt50")
+    mt = load("rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt")
+
+    assert config.async_loop.num_training_steps == 50
+    for field in (
+        "num_prompts_per_train_step",
+        "num_samples_per_prompt",
+        "target_offpolicy_steps",
+        "validation",
+    ):
+        assert getattr(config.async_loop, field) == getattr(mt.async_loop, field)
+    assert (
+        config.rollouter.verifiers_env_server.environment.agent
+        == mt.rollouter.verifiers_env_server.environment.agent
+    )
+    assert config.trainer.parallelism == mt.trainer.parallelism
+    assert config.generator.parallelism == mt.generator.parallelism
+    assert config.num_generators == mt.num_generators == 4
+    assert config.generator.engine.cuda_graph.mode == "FULL_DECODE_ONLY"
+    assert config.generator.engine.profiler == mt.generator.engine.profiler
+    assert config.generator.gpu_memory_limit == mt.generator.gpu_memory_limit
+    assert config.trainer.profiler.profile_freq == 8
+    assert config.trainer.profiler.profiler_repeat == 1
+    assert mt.rollout_recorder.filter.k == 1
+    assert config.rollout_recorder.filter.k == config.async_loop.num_samples_per_prompt
+    assert config.rollout_recorder.filter.keep_errors
 
 
 @pytest.mark.parametrize(
