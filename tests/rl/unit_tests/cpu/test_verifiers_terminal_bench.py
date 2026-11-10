@@ -7,6 +7,7 @@
 """CPU checks for the Terminal-Bench Verifiers recipe."""
 
 import asyncio
+import math
 import os
 import pickle
 import subprocess
@@ -483,6 +484,7 @@ def test_recipe_layouts_fit_the_model(
         "rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt",
         "rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_st",
         "rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt50",
+        "rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt50_64k",
     ],
 )
 def test_trace_recipe_layouts_fit_one_8_gpu_host(name: str) -> None:
@@ -583,6 +585,50 @@ def test_ep1_graphs_mt50_is_its_mt_arm_for_50_steps_recording_every_rollout() ->
     assert mt.rollout_recorder.filter.k == 1
     assert config.rollout_recorder.filter.k == config.async_loop.num_samples_per_prompt
     assert config.rollout_recorder.filter.keep_errors
+
+
+def test_ep1_graphs_mt50_64k_is_mt50_at_64k_with_yarn() -> None:
+    def load(name: str):
+        return ConfigLoader().load(
+            [
+                "--module",
+                "torchtitan_recipes.rl.verifiers_terminal_bench_trace",
+                "--config",
+                name,
+            ]
+        )
+
+    config = load("rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt50_64k")
+    mt50 = load("rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt50")
+
+    for model in (config.trainer.model, config.generator.model):
+        assert model.max_context_length == 65536
+        for layer in model.layers:
+            rope = layer.attention.rope
+            assert rope.max_context_length == 65536
+            assert (rope.scaling, rope.rope_factor, rope.original_seq_len) == (
+                "yarn",
+                2.0,
+                32768,
+            )
+            assert (rope.beta_fast, rope.beta_slow, rope.truncate) == (32, 1, True)
+            assert rope.attention_factor == pytest.approx(0.1 * math.log(2) + 1)
+    assert mt50.trainer.model.layers[0].attention.rope.scaling == "none"
+    assert config.rollouter.generation_server.max_rollout_tokens == 65536
+    assert config.trainer.training.num_tokens_per_microbatch_per_dp_rank == 65536
+    agent = config.rollouter.verifiers_env_server.environment.agent
+    mt50_agent = mt50.rollouter.verifiers_env_server.environment.agent
+    assert agent.timeout.rollout == 3600
+    assert agent.model_copy(update={"timeout": mt50_agent.timeout}) == mt50_agent
+    assert config.async_loop == mt50.async_loop
+    assert config.trainer.parallelism == mt50.trainer.parallelism
+    assert config.generator.parallelism == mt50.generator.parallelism
+    assert config.num_generators == mt50.num_generators
+    assert config.generator.engine == mt50.generator.engine
+    assert config.generator.sampling == mt50.generator.sampling
+    assert config.generator.gpu_memory_limit == mt50.generator.gpu_memory_limit
+    assert config.trainer.profiler == mt50.trainer.profiler
+    assert config.rollout_recorder == mt50.rollout_recorder
 
 
 @pytest.mark.parametrize(

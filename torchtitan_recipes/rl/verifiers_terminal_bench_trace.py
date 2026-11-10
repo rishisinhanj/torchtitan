@@ -21,7 +21,8 @@ Qwen3-30B-A3B-Base also runs every arm with four one-GPU generators (``ep1``)
 instead of one expert-parallel generator, whose all-to-all decode step took
 about 150 ms per token, and ``mt``/``st`` on them with decode CUDA graphs
 (``ep1_graphs``). ``ep1_graphs`` has an ``mt50`` too: ``mt`` for 50 steps, whose
-rollout recorder keeps every rollout.
+rollout recorder keeps every rollout, and an ``mt50_64k``: ``mt50`` with a 64K
+context through YaRN.
 
 Base models score about 0 on these tasks, so zero-variance reward groups are
 trained on instead of dropped; dropping them ends a run after 10 untrainable
@@ -90,19 +91,23 @@ _MAX_OUTPUT_TOKENS = 4096
 
 
 def _trace_rollouter_config(
-    *, max_turns: int, max_concurrent_rollouts: int
+    *,
+    max_turns: int,
+    max_concurrent_rollouts: int,
+    max_context_length: int,
+    rollout_timeout: int,
 ) -> VerifiersRollouter.Config:
     rollouter = _terminal_bench_rollouter_config(
         train_dataset="local/tmax@v1",
         validation_dataset="terminal-bench/terminal-bench-2-1",
-        max_context_length=_MAX_CONTEXT_LENGTH,
+        max_context_length=max_context_length,
         max_turns=max_turns,
         max_concurrent_rollouts=max_concurrent_rollouts,
     )
     environment = rollouter.verifiers_env_server.environment
     # A rollout stuck at upstream's limits (7200 s agent, 12000 s scoring) would
     # hold its group, and the step after it, for longer than a 12-step run takes.
-    timeout = AgentTimeoutConfig(setup=600, rollout=1800, scoring=1800)
+    timeout = AgentTimeoutConfig(setup=600, rollout=rollout_timeout, scoring=1800)
     rollouter.verifiers_env_server.environment = environment.model_copy(
         update={"agent": environment.agent.model_copy(update={"timeout": timeout})}
     )
@@ -119,6 +124,8 @@ def _qwen3_base_terminal_bench_trace(
     generator_parallelism: InferenceParallelismConfig,
     num_generators: int,
     generator_cuda_graph_mode: Literal["NONE", "FULL_DECODE_ONLY"],
+    max_context_length: int = _MAX_CONTEXT_LENGTH,
+    rollout_timeout: int = 1800,
 ) -> Controller.Config:
     """The arm's loop, rollouter and profiling around one model and GPU layout.
 
@@ -142,7 +149,7 @@ def _qwen3_base_terminal_bench_trace(
     trainer_model, generator_model = build_rl_model_configs(
         build_model_config,
         flavor,
-        seq_len=_MAX_CONTEXT_LENGTH,
+        seq_len=max_context_length,
         attn_backend="varlen",
         trainer_parallelism=trainer_parallelism,
         generator_parallelism=generator_parallelism,
@@ -162,6 +169,8 @@ def _qwen3_base_terminal_bench_trace(
             max_turns=max_turns,
             max_concurrent_rollouts=async_loop.max_active_rollout_groups
             * async_loop.num_samples_per_prompt,
+            max_context_length=max_context_length,
+            rollout_timeout=rollout_timeout,
         ),
         renderer=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
         num_generators=num_generators,
@@ -199,7 +208,7 @@ def _qwen3_base_terminal_bench_trace(
             ),
             training=TrainingConfig(
                 disable_accelerator_graphs=True,
-                num_tokens_per_microbatch_per_dp_rank=_MAX_CONTEXT_LENGTH,
+                num_tokens_per_microbatch_per_dp_rank=max_context_length,
             ),
             parallelism=trainer_parallelism,
             activation_remat=FullActivationRematConfig(),
@@ -286,7 +295,13 @@ def _qwen3_30b_a3b_base(arm: _Arm, *, name: str) -> Controller.Config:
 
 
 def _qwen3_30b_a3b_base_ep1(
-    arm: _Arm, *, name: str, cuda_graphs: bool = False
+    arm: _Arm,
+    *,
+    name: str,
+    cuda_graphs: bool = False,
+    flavor: str = "30B-A3B",
+    max_context_length: int = _MAX_CONTEXT_LENGTH,
+    rollout_timeout: int = 1800,
 ) -> Controller.Config:
     """Qwen3-30B-A3B-Base: the trainer of ``_qwen3_30b_a3b_base`` and four one-GPU
     generators (TP=1, EP=1).
@@ -302,7 +317,7 @@ def _qwen3_30b_a3b_base_ep1(
     instead of 256. With decode graphs only prefill steps run eagerly: 64 steps.
     """
     config = _qwen3_base_terminal_bench_trace(
-        "30B-A3B",
+        flavor,
         arm=arm,
         hf_assets_path=f"{_MODELS_DIR}/Qwen3-30B-A3B-Base",
         dump_folder=f"{_RUNS_DIR}/{name}",
@@ -315,6 +330,8 @@ def _qwen3_30b_a3b_base_ep1(
         generator_parallelism=InferenceParallelismConfig(),
         num_generators=4,
         generator_cuda_graph_mode="FULL_DECODE_ONLY" if cuda_graphs else "NONE",
+        max_context_length=max_context_length,
+        rollout_timeout=rollout_timeout,
     )
     config.generator.gpu_memory_limit = 0.8
     if config.generator.engine.profiler is not None:
@@ -387,15 +404,41 @@ def rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_st() -> Controller.Config:
     )
 
 
-def rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt50() -> Controller.Config:
-    """Qwen3-30B-A3B-Base on four one-GPU generators with decode graphs: ``mt`` for 50
-    steps, tracing trainer step 8 only and recording every rollout."""
-    config = _qwen3_30b_a3b_base_ep1(
-        "mt", name="rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt50", cuda_graphs=True
-    )
+def _mt50(config: Controller.Config) -> Controller.Config:
+    """An ``mt`` arm for 50 steps, tracing trainer step 8 only and recording every
+    rollout."""
     config.async_loop.num_training_steps = 50
     # Without a repeat limit the trainer profiler traces every 8th step.
     config.trainer.profiler.profiler_repeat = 1
     # The filter keeps a group of at most 2k rollouts whole.
     config.rollout_recorder.filter.k = config.async_loop.num_samples_per_prompt
     return config
+
+
+def rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt50() -> Controller.Config:
+    """Qwen3-30B-A3B-Base on four one-GPU generators with decode graphs: ``mt`` for 50
+    steps, tracing trainer step 8 only and recording every rollout."""
+    return _mt50(
+        _qwen3_30b_a3b_base_ep1(
+            "mt", name="rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt50", cuda_graphs=True
+        )
+    )
+
+
+def rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt50_64k() -> Controller.Config:
+    """``ep1_graphs`` ``mt50`` with a 64K context: YaRN factor 2 over the model's 32K
+    pretraining context, and a 3600 s rollout timeout.
+
+    The base model writes about 2K tokens a turn, so at 32K most rollouts reach the
+    context limit before their 24 turns, and their tests never run.
+    """
+    return _mt50(
+        _qwen3_30b_a3b_base_ep1(
+            "mt",
+            name="rl_grpo_qwen3_30b_a3b_base_ep1_graphs_tb_mt50_64k",
+            cuda_graphs=True,
+            flavor="30B-A3B-YaRN2",
+            max_context_length=65536,
+            rollout_timeout=3600,
+        )
+    )
