@@ -7,6 +7,8 @@
 """Qwen3 model flavors."""
 
 
+import dataclasses
+import math
 from collections.abc import Callable
 from functools import partial
 
@@ -26,6 +28,7 @@ from torchtitan.models.common import (
     Softmax,
     TransformerBlock,
 )
+from torchtitan.models.common.attention import GQAttention
 from torchtitan.models.common.config_utils import (
     get_attention_config,
     make_ffn_config,
@@ -672,6 +675,32 @@ def _30b_a3b(
     )
 
 
+def _30b_a3b_yarn2(
+    attn_backend: str,
+    *,
+    seq_len: int,
+    parallelism: ParallelismConfig,
+) -> Qwen3Model.Config:
+    """``30B-A3B`` with YaRN factor 2 over its 32K pretraining context, as HF and vLLM
+    apply ``rope_scaling={"rope_type": "yarn", "factor": 2.0,
+    "original_max_position_embeddings": 32768}``."""
+    config = _30b_a3b(attn_backend, seq_len=seq_len, parallelism=parallelism)
+    for layer in config.layers:
+        attention = layer.attention
+        assert isinstance(attention, GQAttention.Config)
+        attention.rope = dataclasses.replace(
+            attention.rope,
+            scaling="yarn",
+            rope_factor=2.0,
+            beta_fast=32.0,
+            beta_slow=1.0,
+            original_seq_len=32768,
+            truncate=True,
+            attention_factor=0.1 * math.log(2.0) + 1.0,
+        )
+    return config
+
+
 def _235b_a22b(
     attn_backend: str,
     *,
@@ -737,6 +766,7 @@ MODEL_FLAVORS = {
     "32B": (_32b, 40960),
     "debugmodel_moe": (_debugmodel_moe, 4096),
     "30B-A3B": (_30b_a3b, 40960),
+    "30B-A3B-YaRN2": (_30b_a3b_yarn2, 65536),
     "235B-A22B": (_235b_a22b, 40960),
 }
 

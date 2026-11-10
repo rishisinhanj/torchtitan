@@ -54,8 +54,8 @@ def _yarn_inv_freq(
     beta_slow`` (interpolation boundary). ``truncate`` floors/ceils the cutoffs
     (DeepSeek style); ``truncate=False`` keeps fractional cutoffs (gpt-oss
     style). The range is always clamped to ``[0, dim - 1]``. The YaRN
-    attention "mscale" is intentionally NOT applied here -- the rope stays a
-    pure rotation and the model folds mscale into its softmax scale.
+    attention "mscale" is intentionally NOT applied here: the model folds it
+    into its softmax scale, or sets ``CosSinRoPE``'s ``attention_factor``.
     """
     inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
 
@@ -385,7 +385,10 @@ class _RotatePairs(torch.autograd.Function):
 class CosSinRoPE(RoPE):
     @dataclass(kw_only=True, slots=True)
     class Config(RoPE.Config):
-        pass
+        attention_factor: float = 1.0
+        """Multiplies the cos/sin cache, so attention logits by its square: YaRN's
+        attention scaling as HF and vLLM apply it (HF's ``attention_factor``), for
+        attention that keeps the default softmax scale."""
 
     @local_compile("rope", batch_invariant=True)
     def forward(
@@ -433,8 +436,8 @@ class CosSinRoPE(RoPE):
         freqs = torch.outer(t, inv_freq).float()
         theta = torch.cat([freqs, freqs], dim=-1)
 
-        cos = theta.cos()
-        sin = theta.sin()
+        cos = theta.cos() * cfg.attention_factor
+        sin = theta.sin() * cfg.attention_factor
         return torch.cat([cos, sin], dim=-1)
 
     def _reshape_cache(

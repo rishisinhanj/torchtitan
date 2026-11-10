@@ -299,6 +299,45 @@ class TestYaRNScaling(unittest.TestCase):
         expected_softmax_scale = attention.qk_head_dim**-0.5 * expected_mscale**2
         self.assertAlmostEqual(attention.softmax_scale, expected_softmax_scale)
 
+    def test_qwen3_yarn2_flavor_matches_hf_yarn(self):
+        """``30B-A3B-YaRN2``'s cos/sin cache is HF's YaRN rotary embedding for
+        ``rope_scaling={"rope_type": "yarn", "factor": 2.0,
+        "original_max_position_embeddings": 32768}``, attention factor included."""
+        try:
+            from transformers import Qwen3MoeConfig
+            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+        except ImportError:
+            self.skipTest("transformers is not installed")
+        from torchtitan.models.qwen3 import build_model_config
+
+        seq_len = 65536
+        model_config = build_model_config(
+            "30B-A3B-YaRN2", seq_len=seq_len, parallelism=ParallelismConfig()
+        )
+        rope_config = model_config.layers[0].attention.rope
+        hf_config = Qwen3MoeConfig(
+            head_dim=rope_config.dim,
+            # HF derives the YaRN factor from this over the original length.
+            max_position_embeddings=seq_len,
+            rope_parameters={
+                "rope_type": "yarn",
+                "rope_theta": rope_config.theta,
+                "factor": 2.0,
+                "original_max_position_embeddings": 32768,
+            },
+        )
+        inv_freq, attention_factor = ROPE_INIT_FUNCTIONS["yarn"](
+            hf_config, torch.device("cpu")
+        )
+        freqs = torch.outer(torch.arange(seq_len).float(), inv_freq.float())
+        theta = torch.cat([freqs, freqs], dim=-1)
+        expected = torch.cat([theta.cos(), theta.sin()], dim=-1) * attention_factor
+
+        self.assertAlmostEqual(rope_config.attention_factor, attention_factor)
+        torch.testing.assert_close(
+            rope_config.build().cache, expected, atol=1e-4, rtol=0
+        )
+
 
 class TestPerLayerRoPECache(unittest.TestCase):
     def test_gqa_attention_uses_layer_rope_cache(self):
