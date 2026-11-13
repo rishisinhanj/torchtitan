@@ -21,7 +21,9 @@ recipe's. What differs:
 ``rl_grpo_qwen35_9b_base_tb_8gpu`` loads the base weights and never saves.
 ``rl_grpo_qwen35_9b_base_tb_8gpu_ckpt20`` also saves a full checkpoint at step 1
 and every 20 steps (a crashed run resumes from the latest) and a bfloat16
-model-only export at the last step.
+model-only export at the last step. ``rl_grpo_qwen35_9b_base_tb_8gpu_ckpt10``
+saves every 10 steps, for continuing a run from one of its full checkpoints
+(``--resume-step``) on an allocation too short for 20 more steps.
 """
 
 from renderers import Qwen35RendererConfig
@@ -193,6 +195,18 @@ def rl_grpo_qwen35_9b_base_tb_8gpu_ckpt20() -> Controller.Config:
         initial_load_in_hf=True,
         enable_first_step_checkpoint=True,
         interval=20,
+        last_save_model_only=True,
+        export_dtype="bfloat16",
+    )
+    return config
+
+
+def rl_grpo_qwen35_9b_base_tb_8gpu_ckpt10() -> Controller.Config:
+    """``rl_grpo_qwen35_9b_base_tb_8gpu``, saving a full checkpoint every 10 steps."""
+    config = rl_grpo_qwen35_9b_base_tb_8gpu()
+    config.trainer.checkpointer = CheckpointManager.Config(
+        initial_load_in_hf=True,
+        interval=10,
         last_save_model_only=True,
         export_dtype="bfloat16",
     )
