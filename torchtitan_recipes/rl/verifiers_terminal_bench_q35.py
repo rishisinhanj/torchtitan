@@ -23,7 +23,9 @@ recipe's. What differs:
 and every 20 steps (a crashed run resumes from the latest) and a bfloat16
 model-only export at the last step. ``rl_grpo_qwen35_9b_base_tb_8gpu_ckpt10``
 saves every 10 steps, for continuing a run from one of its full checkpoints
-(``--resume-step``) on an allocation too short for 20 more steps.
+(``--resume-step``) on an allocation too short for 20 more steps, and
+``rl_grpo_qwen35_9b_base_tb_8gpu_ckpt5`` every 5, so that a time limit that is
+not a multiple of 10 steps loses fewer of them (the time-limit SIGINT saves nothing).
 """
 
 from renderers import Qwen35RendererConfig
@@ -207,6 +209,18 @@ def rl_grpo_qwen35_9b_base_tb_8gpu_ckpt10() -> Controller.Config:
     config.trainer.checkpointer = CheckpointManager.Config(
         initial_load_in_hf=True,
         interval=10,
+        last_save_model_only=True,
+        export_dtype="bfloat16",
+    )
+    return config
+
+
+def rl_grpo_qwen35_9b_base_tb_8gpu_ckpt5() -> Controller.Config:
+    """``rl_grpo_qwen35_9b_base_tb_8gpu``, saving a full checkpoint every 5 steps."""
+    config = rl_grpo_qwen35_9b_base_tb_8gpu()
+    config.trainer.checkpointer = CheckpointManager.Config(
+        initial_load_in_hf=True,
+        interval=5,
         last_save_model_only=True,
         export_dtype="bfloat16",
     )
