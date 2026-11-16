@@ -7,7 +7,8 @@
 """vLLM paged-cache adapter for TorchTitan's Gated DeltaNet.
 
 The enclosing Qwen3.5 module owns all parameters. This adapter runs Attention
-Gym's paging-aware convolution and GDN kernels.
+Gym's paging-aware convolution and GDN kernels. Attention Gym's kernels do not
+build on ROCm, where the adapter runs vLLM's own Triton GDN kernels instead.
 
 Batch-invariant execution has two additional requirements:
 
@@ -30,6 +31,15 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFuncCalculator,
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
+)
+from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
+from vllm.third_party.flash_linear_attention.ops import (
+    chunk_gated_delta_rule,
+    fused_post_conv_prep,
+    fused_sigmoid_gating_delta_rule_update,
 )
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -209,6 +219,17 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             and cu_seqlens is not None
             and has_initial_state is not None
         )
+        if torch.version.hip is not None:
+            return self._forward_vllm_kernels(
+                mixed_qkv,
+                a,
+                b,
+                conv_weight,
+                A_log,
+                dt_bias,
+                gdn_metadata,
+                output_shape,
+            )
         # SP/model-input rounding need not pad attention metadata. FULL bucket
         # padding does: its prepared rows and captured slices stay fixed while
         # the builder restages slots and freshness, including null padding.
@@ -317,6 +338,123 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
                 num_tokens - num_actual_tokens, *output.shape[1:]
             )
             output = torch.cat([output, padding])
+        return output
+
+    def _forward_vllm_kernels(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_weight: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        gdn_metadata: TorchTitanLinearAttentionMetadata,
+        output_shape: tuple[int, int, int],
+    ) -> torch.Tensor:
+        """Run vLLM's Triton GDN kernels on the same state pools, as vLLM's GDN layer does.
+
+        Single-token steps run vLLM's decode kernels, which FULL_DECODE_ONLY graphs
+        capture. They take no ``has_initial_state``, so a request whose first scheduled
+        chunk is one token would resume its slot's previous state. Packed steps run
+        eagerly through the convolution and chunk kernels for every request, which honor
+        ``has_initial_state``; the chunk kernel takes gathered states, not slots.
+        """
+        if is_in_batch_invariant_mode():
+            raise NotImplementedError(
+                "Batch-invariant GDN runs Attention Gym's scan, which does not build "
+                "on ROCm."
+            )
+        # vLLM's kernels read the convolution history as (dim, width - 1).
+        conv_state = self.kv_cache[0].transpose(-1, -2)
+        ssm_state = self.kv_cache[1]
+        output = mixed_qkv.new_empty(output_shape)
+        if gdn_metadata.execution_path is LinearAttentionExecutionPath.SINGLE_TOKEN:
+            # vLLM's convolution skips only slot 0, and would index a negative one.
+            state_indices = gdn_metadata.non_spec_state_indices_tensor.clamp(min=0)
+            num_rows = state_indices.numel()
+            conv_output = causal_conv1d_update(
+                mixed_qkv[:num_rows],
+                conv_state,
+                conv_weight,
+                activation="silu",
+                conv_state_indices=state_indices,
+                out=torch.empty_like(mixed_qkv[:num_rows]),
+            )
+            key_dim = self.local_num_k_heads * self.head_k_dim
+            qk_shape = (num_rows, 1, self.local_num_k_heads, self.head_k_dim)
+            decode_output, _ = fused_sigmoid_gating_delta_rule_update(
+                A_log,
+                a[:num_rows].unsqueeze(1),
+                b[:num_rows].unsqueeze(1),
+                dt_bias,
+                conv_output[:, :key_dim].view(qk_shape),
+                conv_output[:, key_dim : 2 * key_dim].view(qk_shape),
+                conv_output[:, 2 * key_dim :].view(
+                    num_rows, 1, self.local_num_v_heads, self.head_v_dim
+                ),
+                scale=self.head_k_dim**-0.5,
+                initial_state=ssm_state,
+                inplace_final_state=True,
+                ssm_state_indices=state_indices,
+                use_qk_l2norm_in_kernel=True,
+            )
+            # The decode kernel skips null rows without writing their output.
+            output[:num_rows] = decode_output.view(
+                output[:num_rows].shape
+            ).masked_fill_((state_indices == 0).view(-1, 1, 1), 0)
+            # Rows past the decode batch must stay defined across graph replays.
+            output[num_rows:].zero_()
+            return output
+
+        if torch.cuda.is_current_stream_capturing():
+            raise NotImplementedError(
+                "vLLM's GDN chunk kernels cannot be captured; on ROCm use "
+                "VLLMCudaGraphConfig(mode='FULL_DECODE_ONLY')."
+            )
+        # Eager: the host-side counts bound the real requests, none in a null slot.
+        num_requests = gdn_metadata.num_decodes + gdn_metadata.num_prefills
+        num_actual_tokens = gdn_metadata.num_actual_tokens
+        cu_seqlens = gdn_metadata.non_spec_query_start_loc[: num_requests + 1]
+        slots = gdn_metadata.non_spec_state_indices_tensor[:num_requests]
+        has_initial_state = gdn_metadata.has_initial_state[:num_requests]
+        conv_output = causal_conv1d_fn(
+            mixed_qkv[:num_actual_tokens].transpose(0, 1),
+            conv_weight,
+            None,
+            conv_state,
+            cu_seqlens,
+            cache_indices=slots,
+            has_initial_state=has_initial_state,
+            activation="silu",
+        ).transpose(0, 1)
+        query, key, value, decay, update_gate = fused_post_conv_prep(
+            conv_output,
+            a[:num_actual_tokens],
+            b[:num_actual_tokens],
+            A_log,
+            dt_bias,
+            num_k_heads=self.local_num_k_heads,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+        )
+        initial_state = ssm_state[slots].masked_fill_(
+            ~has_initial_state.view(-1, 1, 1, 1), 0
+        )
+        recurrent_output, final_state = chunk_gated_delta_rule(
+            query.unsqueeze(0),
+            key.unsqueeze(0),
+            value.unsqueeze(0),
+            decay.unsqueeze(0),
+            update_gate.unsqueeze(0),
+            scale=self.head_k_dim**-0.5,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+        )
+        ssm_state[slots] = final_state.to(ssm_state.dtype)
+        output[:num_actual_tokens] = recurrent_output[0]
+        # Zero the rows past the metadata (eager SP/model-input rounding).
+        output[num_actual_tokens:].zero_()
         return output
 
     def _forward_gdn(

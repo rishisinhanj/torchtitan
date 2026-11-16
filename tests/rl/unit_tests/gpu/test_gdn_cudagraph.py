@@ -156,6 +156,12 @@ def test_gdn_full_runner_matches_eager(tmp_path: Path, batch_invariant: bool) ->
 @pytest.mark.parametrize(
     "batch_invariant", [False, True], ids=["regular", "batch-invariant"]
 )
+@pytest.mark.xfail(
+    torch.version.hip is not None,
+    reason="On ROCm, vLLM's decode kernels take no has_initial_state, so a fresh "
+    "single-token row reads its reused slot; batch-invariant GDN is unsupported there",
+    strict=True,
+)
 def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -> None:
     monkeypatch.setattr(gdn, "is_in_batch_invariant_mode", lambda: batch_invariant)
     monkeypatch.setattr(
