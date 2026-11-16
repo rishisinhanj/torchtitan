@@ -8,7 +8,8 @@
 
 The enclosing Qwen3.5 module owns all parameters. This adapter runs Attention
 Gym's paging-aware convolution and GDN kernels. Attention Gym's kernels do not
-build on ROCm, where the adapter runs vLLM's own Triton GDN kernels instead.
+build on ROCm, where the adapter runs vLLM's Triton convolution and decode
+kernels and flash-linear-attention's chunk kernel instead, as the trainer does.
 
 Batch-invariant execution has two additional requirements:
 
@@ -37,7 +38,6 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update,
 )
 from vllm.third_party.flash_linear_attention.ops import (
-    chunk_gated_delta_rule,
     fused_post_conv_prep,
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -46,7 +46,7 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 from torchtitan.models.common.attention import InnerAttention, LinearAttentionMetadata
-from torchtitan.models.common.attention.gdn import GDN
+from torchtitan.models.common.attention.gdn import _fla_chunk_gdn, GDN
 from torchtitan.models.common.attn_gym import (
     causal_conv1d_decode,
     paged_causal_conv1d,
@@ -220,7 +220,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             and has_initial_state is not None
         )
         if torch.version.hip is not None:
-            return self._forward_vllm_kernels(
+            return self._forward_rocm(
                 mixed_qkv,
                 a,
                 b,
@@ -340,7 +340,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             output = torch.cat([output, padding])
         return output
 
-    def _forward_vllm_kernels(
+    def _forward_rocm(
         self,
         mixed_qkv: torch.Tensor,
         a: torch.Tensor,
@@ -351,13 +351,15 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         gdn_metadata: TorchTitanLinearAttentionMetadata,
         output_shape: tuple[int, int, int],
     ) -> torch.Tensor:
-        """Run vLLM's Triton GDN kernels on the same state pools, as vLLM's GDN layer does.
+        """Run Triton GDN kernels on the same state pools, as vLLM's GDN layer does.
 
         Single-token steps run vLLM's decode kernels, which FULL_DECODE_ONLY graphs
         capture. They take no ``has_initial_state``, so a request whose first scheduled
         chunk is one token would resume its slot's previous state. Packed steps run
-        eagerly through the convolution and chunk kernels for every request, which honor
-        ``has_initial_state``; the chunk kernel takes gathered states, not slots.
+        eagerly through vLLM's convolution and flash-linear-attention's chunk kernel for
+        every request, which honor ``has_initial_state``; the chunk kernel takes gathered
+        states, not slots. vLLM bundles a copy of that chunk kernel, but before vLLM 0.32
+        the copy uses ``tl.make_block_ptr``, which Triton 3.9 removed.
         """
         if is_in_batch_invariant_mode():
             raise NotImplementedError(
@@ -408,7 +410,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
 
         if torch.cuda.is_current_stream_capturing():
             raise NotImplementedError(
-                "vLLM's GDN chunk kernels cannot be captured; on ROCm use "
+                "The GDN chunk kernel cannot be captured; on ROCm use "
                 "VLLMCudaGraphConfig(mode='FULL_DECODE_ONLY')."
             )
         # Eager: the host-side counts bound the real requests, none in a null slot.
@@ -440,7 +442,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         initial_state = ssm_state[slots].masked_fill_(
             ~has_initial_state.view(-1, 1, 1, 1), 0
         )
-        recurrent_output, final_state = chunk_gated_delta_rule(
+        recurrent_output, final_state = _fla_chunk_gdn()(
             query.unsqueeze(0),
             key.unsqueeze(0),
             value.unsqueeze(0),
@@ -449,7 +451,9 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             scale=self.head_k_dim**-0.5,
             initial_state=initial_state,
             output_final_state=True,
-            cu_seqlens=cu_seqlens,
+            # vLLM's SSM slots hold each head's state as (V, K).
+            state_v_first=True,
+            cu_seqlens=cu_seqlens.long(),
         )
         ssm_state[slots] = final_state.to(ssm_state.dtype)
         output[:num_actual_tokens] = recurrent_output[0]

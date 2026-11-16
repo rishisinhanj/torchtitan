@@ -4,8 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The vLLM generator's GDN on ROCm (vLLM's Triton kernels) against the float32 gated
-delta rule, through prefill, mixed and decode steps on paged state pools.
+"""The vLLM generator's GDN on ROCm (vLLM's Triton convolution and decode kernels,
+flash-linear-attention's chunk kernel) against the float32 gated delta rule, through
+prefill, mixed and decode steps on paged state pools.
 
 Shape suffixes: T tokens, C channels, H value heads, HK key heads, K key head dim,
 V value head dim, W convolution width.
@@ -29,7 +30,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is None,
-    reason="the vLLM-kernel GDN path runs on ROCm",
+    reason="the Triton-kernel GDN path runs on ROCm",
 )
 
 NUM_K_HEADS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM, WIDTH = 2, 4, 128, 128, 4
