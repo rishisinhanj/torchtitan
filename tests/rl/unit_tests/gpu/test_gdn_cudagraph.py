@@ -48,6 +48,12 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 @pytest.mark.parametrize(
     "batch_invariant", [False, True], ids=["regular", "batch-invariant"]
 )
+@pytest.mark.xfail(
+    torch.version.hip is not None,
+    reason="On ROCm, packed GDN steps run eagerly, so they are captured with "
+    "FULL_DECODE_ONLY rather than FULL; batch-invariant GDN is unsupported there",
+    strict=True,
+)
 def test_gdn_full_runner_matches_eager(tmp_path: Path, batch_invariant: bool) -> None:
     model = os.environ.get(MODEL_ENV)
     if not model:
@@ -155,6 +161,12 @@ def test_gdn_full_runner_matches_eager(tmp_path: Path, batch_invariant: bool) ->
 
 @pytest.mark.parametrize(
     "batch_invariant", [False, True], ids=["regular", "batch-invariant"]
+)
+@pytest.mark.xfail(
+    torch.version.hip is not None,
+    reason="On ROCm, vLLM's decode kernels take no has_initial_state, so a fresh "
+    "single-token row reads its reused slot; batch-invariant GDN is unsupported there",
+    strict=True,
 )
 def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -> None:
     monkeypatch.setattr(gdn, "is_in_batch_invariant_mode", lambda: batch_invariant)
@@ -328,7 +340,9 @@ def run_engine(mode: str, output: Path, batch_invariant: bool) -> None:
             distributed_executor_backend="external_launcher",
             tensor_parallel_size=1,
             enforce_eager=mode == "eager",
-            attention_config={"backend": "CUSTOM"},
+            attention_config={
+                "backend": registry.vllm_attention_backend(model_config).name
+            },
             compilation_config={
                 "mode": 0,
                 "cudagraph_mode": "FULL" if mode == "full" else "NONE",

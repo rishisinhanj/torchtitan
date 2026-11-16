@@ -4,13 +4,16 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Gated DeltaNet linear attention backed by Attention Gym."""
+"""Gated DeltaNet linear attention backed by Attention Gym (flash-linear-attention on ROCm)."""
 
 # Shape suffixes:
 # B = batch, T = packed tokens, D = model dimension, C = projection channels,
 # H = attention heads, K = query/key head dimension, V = value head dimension,
 # S = state slots, W = convolution kernel width, G = key-head groups.
 
+import functools
+import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import spmd_types as spmd
@@ -52,6 +55,55 @@ for _kernel_function in (_ChunkGDN, ChunkGdnCudnnPacked):
         spmd.register_local_autograd_function(_kernel_function)
 
 
+def _use_fla() -> bool:
+    """Whether GDN runs flash-linear-attention's Triton kernels.
+
+    Attention Gym's GDN kernels do not run on ROCm (they import CuTe modules and
+    use CUDA-only Triton options) and its convolution is CuTe-only, so ROCm runs
+    flash-linear-attention's chunk kernel and a torch convolution.
+    """
+    return torch.version.hip is not None
+
+
+@functools.cache
+def _fla_chunk_gdn() -> Callable[..., tuple[torch.Tensor, torch.Tensor | None]]:
+    """Return flash-linear-attention's chunk GDN, registered as a local SPMD function.
+
+    Imported on first use: importing fla queries the device.
+    """
+    try:
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+        from fla.ops.gated_delta_rule.chunk import ChunkGatedDeltaRuleFunction
+    except ModuleNotFoundError as error:
+        raise ModuleNotFoundError(
+            "GDN on ROCm requires flash-linear-attention. "
+            "Install it with: python -m pip install --no-deps 'fla-core==0.6.0'.",
+            name=error.name,
+        ) from error
+    spmd.register_local_autograd_function(ChunkGatedDeltaRuleFunction)
+    return chunk_gated_delta_rule
+
+
+def _torch_causal_conv1d_varlen(
+    x_TC: torch.Tensor, weight_C1W: torch.Tensor, cu_seqlens: torch.Tensor
+) -> torch.Tensor:
+    """Depthwise causal conv with per-document resets, then SiLU, in float32."""
+    num_tokens = x_TC.shape[0]
+    width = weight_C1W.shape[-1]
+    token_index_T = torch.arange(num_tokens, device=x_TC.device, dtype=cu_seqlens.dtype)
+    document_index_T = torch.searchsorted(cu_seqlens, token_index_T, right=True) - 1
+    position_T1 = (token_index_T - cu_seqlens[document_index_T]).unsqueeze(-1)
+    x_TC_fp32 = x_TC.float()
+    weight_CW = weight_C1W[:, 0].float()
+    out_TC = x_TC_fp32 * weight_CW[:, -1]
+    for shift in range(1, width):
+        shifted_TC = F.pad(x_TC_fp32, (0, 0, shift, 0))[:num_tokens]
+        out_TC = out_TC + shifted_TC.masked_fill(position_T1 < shift, 0) * (
+            weight_CW[:, -1 - shift]
+        )
+    return F.silu(out_TC).to(x_TC.dtype)
+
+
 @spmd.local_map(
     in_types=(
         {"dp": spmd.S(0), "tp": spmd.S(1)},
@@ -65,11 +117,13 @@ def _causal_conv1d_varlen(
     weight: torch.Tensor,
     cu_seqlens: torch.Tensor,
 ) -> torch.Tensor:
-    """Depthwise causal conv with per-document resets (CUDA-only).
+    """Depthwise causal conv with per-document resets.
 
     A pure-torch per-document reference lives in
     ``tests/unit_tests/gpu/models/qwen3_5/test_qwen3_5_deltanet.py``.
     """
+    if _use_fla():
+        return _torch_causal_conv1d_varlen(x_TD, weight, cu_seqlens)
     out_BTD = causal_conv1d(
         x_TD.unsqueeze(0),
         weight.squeeze(1),
@@ -307,8 +361,11 @@ class GDNKernel(Module):
         pass
 
     def __init__(self, config: Config):
-        # Every attn_gym export this module calls; keep the list in sync.
-        require_attn_gym(chunk_gdn, recurrent_gdn, l2norm)
+        if _use_fla():
+            _fla_chunk_gdn()
+        else:
+            # Every attn_gym export this module calls; keep the list in sync.
+            require_attn_gym(chunk_gdn, recurrent_gdn, l2norm)
         super().__init__()
 
     def forward(
@@ -326,6 +383,35 @@ class GDNKernel(Module):
         xv_BTHV = xv_THV.unsqueeze(0)
         g_BTH = g_TH.unsqueeze(0)
         beta_BTH = beta_TH.unsqueeze(0)
+
+        if _use_fla():
+            if is_in_batch_invariant_mode():
+                raise NotImplementedError(
+                    "Batch-invariant GDN is not supported on ROCm: it needs Attention "
+                    "Gym's batch-invariant recurrent scan, and ROCm runs "
+                    "flash-linear-attention's chunk kernel."
+                )
+            if torch.are_deterministic_algorithms_enabled():
+                message = (
+                    "GDN on ROCm has no deterministic implementation, but "
+                    "torch.use_deterministic_algorithms(True) is set: "
+                    "flash-linear-attention's Triton kernels pick their launch "
+                    "configurations by timing, so bits can differ between processes."
+                )
+                if not torch.is_deterministic_algorithms_warn_only_enabled():
+                    raise RuntimeError(message)
+                warnings.warn(message, stacklevel=2)
+            output, _ = _fla_chunk_gdn()(
+                xq_BTHK,
+                xk_BTHK,
+                xv_BTHV,
+                g_BTH,
+                beta_BTH,
+                scale=xq_BTHK.shape[-1] ** -0.5,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=None if cu_seqlens is None else cu_seqlens.long(),
+            )
+            return output.squeeze(0)
 
         if is_in_batch_invariant_mode() and cu_seqlens is not None:
             return _batch_invariant_recurrent_gdn_fwd(
@@ -386,8 +472,9 @@ class InnerGDN(InnerAttention):
             )
 
     def __init__(self, config: Config):
-        # Every attn_gym export this module calls; keep the list in sync.
-        require_attn_gym(causal_conv1d)
+        if not _use_fla():
+            # Every attn_gym export this module calls; keep the list in sync.
+            require_attn_gym(causal_conv1d)
         super().__init__()
         self.kernel = config.kernel.build()
 

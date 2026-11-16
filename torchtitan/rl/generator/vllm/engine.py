@@ -344,8 +344,10 @@ class VLLMEngine(GenerationEngine):
         # - None: every full block boundary, as before v0.29. Blocks are still freed
         #   when the request moves past them; hashed ones stay reusable until evicted.
         engine_kwargs["prefix_cache_retention_interval"] = None
-        # FA2 requires block_size to be a multiple of 256
-        if not has_cuda_capability(9, 0):
+        # FA2 requires block_size to be a multiple of 256. ROCm keeps vLLM's default (16): its custom
+        # paged-attention decode kernel only takes 16- or 32-token blocks, and the Triton fallback it uses
+        # otherwise does not split the context across workgroups.
+        if torch.version.hip is None and not has_cuda_capability(9, 0):
             engine_kwargs["block_size"] = 256
         vllm_compilation_config = self.config.cuda_graph.get_vllm_compilation_config(
             max_num_seqs=max_num_seqs,
@@ -636,5 +638,7 @@ def _extract_request_metrics_inputs(
         last_token_ts=stats.last_token_ts,
         first_token_latency=stats.first_token_latency,
         num_generation_tokens=stats.num_generation_tokens,
-        num_preemptions=stats.num_preemptions,
+        # TODO: read stats.num_preemptions directly once ROCm images ship a vLLM
+        # newer than 0.29, whose RequestStateStats has no num_preemptions.
+        num_preemptions=getattr(stats, "num_preemptions", 0),
     )

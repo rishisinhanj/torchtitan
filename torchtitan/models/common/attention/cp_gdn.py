@@ -28,7 +28,7 @@ from .cp_linear_attention import (
     prepare_ulysses_linear_attention_metadata,
     UlyssesLinearAttentionMetadata,
 )
-from .gdn import InnerGDN
+from .gdn import _use_fla, InnerGDN
 from .linear_attention import LinearAttentionMetadata
 
 # Shape suffixes: T = tokens, C = channels, H = heads, K/V = head dimensions,
@@ -153,6 +153,13 @@ class ContextParallelInnerGDN(
         pass
 
     def __init__(self, config: Config):
+        if _use_fla():
+            raise NotImplementedError(
+                "Gated DeltaNet context parallelism with state routing is not "
+                "supported on ROCm: it runs Attention Gym's context-parallel kernels, "
+                "and ROCm runs flash-linear-attention's chunk kernel. "
+                "UlyssesInnerGDN shards heads instead and runs that kernel."
+            )
         # Every attn_gym export this module calls; keep the list in sync.
         require_attn_gym(
             context_parallel_gdn,

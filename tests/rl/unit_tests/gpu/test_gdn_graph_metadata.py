@@ -366,6 +366,8 @@ def test_runner_tells_builders_the_selected_graph(mode, uniform, replays_packed_
 
 @pytest.mark.parametrize("decode", [False, True])
 def test_forward_respects_prepared_extent_and_decode_padding(monkeypatch, decode):
+    # The Attention Gym path, which ROCm replaces with vLLM's kernels.
+    monkeypatch.setattr(torch.version, "hip", None)
     layer = gdn.VLLMInnerGDN.__new__(gdn.VLLMInnerGDN)
     torch.nn.Module.__init__(layer)
     layer.prefix, layer.kv_cache = "gdn", (torch.empty(0), torch.empty(0))
@@ -483,6 +485,8 @@ def test_packed_forward_routes_decode_rows(monkeypatch, capturing):
 
     Graph capture runs the decode kernel on every request row; eager, on the decode requests.
     """
+    # The Attention Gym path, which ROCm replaces with vLLM's kernels.
+    monkeypatch.setattr(torch.version, "hip", None)
     # `_stage_decode_split`'s example: 2 decode requests, then a 3-token prefill; 6 rows.
     metadata = _packed_metadata([0, 1, 2, 5], [6, 4, 3], [5, 7, 9], max_num_seqs=4)
     assert metadata.decode_state_indices.tolist() == [5, 7, 0, 0]
@@ -532,6 +536,9 @@ def test_packed_forward_routes_decode_rows(monkeypatch, capturing):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.version.hip is not None, reason="Attention Gym's kernels do not build on ROCm"
+)
 def test_packed_decode_routing_matches_recurrence(monkeypatch) -> None:
     """A mixed step's decode rows (decode kernel) and prefill rows (chunk kernel) match the
     batch-invariant path, which runs the plain recurrence over the same packed batch."""
