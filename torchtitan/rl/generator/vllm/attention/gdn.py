@@ -356,10 +356,10 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         Single-token steps run vLLM's decode kernels, which FULL_DECODE_ONLY graphs
         capture. They take no ``has_initial_state``, so a request whose first scheduled
         chunk is one token would resume its slot's previous state. Packed steps run
-        eagerly through vLLM's convolution and flash-linear-attention's chunk kernel for
-        every request, which honor ``has_initial_state``; the chunk kernel takes gathered
-        states, not slots. vLLM bundles a copy of that chunk kernel, but before vLLM 0.32
-        the copy uses ``tl.make_block_ptr``, which Triton 3.9 removed.
+        eagerly: vLLM's convolution honors ``has_initial_state``, flash-linear-attention's
+        chunk kernel starts from gathered states masked by it, and decode rows that all
+        resume a state take the decode kernel. vLLM bundles a copy of that chunk kernel,
+        but before vLLM 0.32 the copy uses ``tl.make_block_ptr``, which Triton 3.9 removed.
         """
         if is_in_batch_invariant_mode():
             raise NotImplementedError(
@@ -382,27 +382,9 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
                 conv_state_indices=state_indices,
                 out=torch.empty_like(mixed_qkv[:num_rows]),
             )
-            key_dim = self.local_num_k_heads * self.head_k_dim
-            qk_shape = (num_rows, 1, self.local_num_k_heads, self.head_k_dim)
-            decode_output, _ = fused_sigmoid_gating_delta_rule_update(
-                A_log,
-                a[:num_rows].unsqueeze(1),
-                b[:num_rows].unsqueeze(1),
-                dt_bias,
-                conv_output[:, :key_dim].view(qk_shape),
-                conv_output[:, key_dim : 2 * key_dim].view(qk_shape),
-                conv_output[:, 2 * key_dim :].view(
-                    num_rows, 1, self.local_num_v_heads, self.head_v_dim
-                ),
-                scale=self.head_k_dim**-0.5,
-                initial_state=ssm_state,
-                inplace_final_state=True,
-                ssm_state_indices=state_indices,
-                use_qk_l2norm_in_kernel=True,
-            )
             # The decode kernel skips null rows without writing their output.
-            output[:num_rows] = decode_output.view(
-                output[:num_rows].shape
+            output[:num_rows] = self._recurrent_decode(
+                conv_output, a[:num_rows], b[:num_rows], A_log, dt_bias, state_indices
             ).masked_fill_((state_indices == 0).view(-1, 1, 1), 0)
             # Rows past the decode batch must stay defined across graph replays.
             output[num_rows:].zero_()
@@ -429,37 +411,87 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             has_initial_state=has_initial_state,
             activation="silu",
         ).transpose(0, 1)
-        query, key, value, decay, update_gate = fused_post_conv_prep(
-            conv_output,
-            a[:num_actual_tokens],
-            b[:num_actual_tokens],
-            A_log,
-            dt_bias,
-            num_k_heads=self.local_num_k_heads,
-            head_k_dim=self.head_k_dim,
-            head_v_dim=self.head_v_dim,
-        )
-        initial_state = ssm_state[slots].masked_fill_(
-            ~has_initial_state.view(-1, 1, 1, 1), 0
-        )
-        recurrent_output, final_state = _fla_chunk_gdn()(
-            query.unsqueeze(0),
-            key.unsqueeze(0),
-            value.unsqueeze(0),
-            decay.unsqueeze(0),
-            update_gate.unsqueeze(0),
-            scale=self.head_k_dim**-0.5,
-            initial_state=initial_state,
-            output_final_state=True,
-            # vLLM's SSM slots hold each head's state as (V, K).
-            state_v_first=True,
-            cu_seqlens=cu_seqlens.long(),
-        )
-        ssm_state[slots] = final_state.to(ssm_state.dtype)
-        output[:num_actual_tokens] = recurrent_output[0]
+        # vLLM orders the one-token requests first. They take the decode kernel unless
+        # one is a fresh prompt, which only the chunk kernel starts from a zero state.
+        num_decodes = gdn_metadata.num_decodes
+        if num_decodes and not has_initial_state[:num_decodes].all():
+            num_decodes = 0
+        if num_decodes:
+            output[:num_decodes] = self._recurrent_decode(
+                conv_output[:num_decodes],
+                a[:num_decodes],
+                b[:num_decodes],
+                A_log,
+                dt_bias,
+                slots[:num_decodes],
+            )
+        if num_decodes < num_requests:
+            query, key, value, decay, update_gate = fused_post_conv_prep(
+                conv_output[num_decodes:],
+                a[num_decodes:num_actual_tokens],
+                b[num_decodes:num_actual_tokens],
+                A_log,
+                dt_bias,
+                num_k_heads=self.local_num_k_heads,
+                head_k_dim=self.head_k_dim,
+                head_v_dim=self.head_v_dim,
+            )
+            chunk_slots = slots[num_decodes:]
+            initial_state = ssm_state[chunk_slots].masked_fill_(
+                ~has_initial_state[num_decodes:].view(-1, 1, 1, 1), 0
+            )
+            recurrent_output, final_state = _fla_chunk_gdn()(
+                query.unsqueeze(0),
+                key.unsqueeze(0),
+                value.unsqueeze(0),
+                decay.unsqueeze(0),
+                update_gate.unsqueeze(0),
+                scale=self.head_k_dim**-0.5,
+                initial_state=initial_state,
+                output_final_state=True,
+                # vLLM's SSM slots hold each head's state as (V, K).
+                state_v_first=True,
+                cu_seqlens=(cu_seqlens[num_decodes:] - num_decodes).long(),
+            )
+            ssm_state[chunk_slots] = final_state.to(ssm_state.dtype)
+            output[num_decodes:num_actual_tokens] = recurrent_output[0]
         # Zero the rows past the metadata (eager SP/model-input rounding).
         output[num_actual_tokens:].zero_()
         return output
+
+    def _recurrent_decode(
+        self,
+        conv_output: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        state_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """One recurrence step per row, in place on each row's SSM slot (vLLM's kernel).
+
+        Rows with a null slot (0) are skipped and left unwritten.
+        """
+        num_rows = conv_output.shape[0]
+        key_dim = self.local_num_k_heads * self.head_k_dim
+        qk_shape = (num_rows, 1, self.local_num_k_heads, self.head_k_dim)
+        output, _ = fused_sigmoid_gating_delta_rule_update(
+            A_log,
+            a.unsqueeze(1),
+            b.unsqueeze(1),
+            dt_bias,
+            conv_output[:, :key_dim].view(qk_shape),
+            conv_output[:, key_dim : 2 * key_dim].view(qk_shape),
+            conv_output[:, 2 * key_dim :].view(
+                num_rows, 1, self.local_num_v_heads, self.head_v_dim
+            ),
+            scale=self.head_k_dim**-0.5,
+            initial_state=self.kv_cache[1],
+            inplace_final_state=True,
+            ssm_state_indices=state_indices,
+            use_qk_l2norm_in_kernel=True,
+        )
+        return output.view(num_rows, self.local_num_v_heads, self.head_v_dim)
 
     def _forward_gdn(
         self,
